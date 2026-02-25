@@ -10,11 +10,15 @@ from reportlab.lib.styles import getSampleStyleSheet
 
 st.title("Exam Seating PDF Generator")
 
-uploaded_file = st.file_uploader("Upload the student list as an Excel file", type=["xlsx"])
+# Initialize session state for assignments
+if 'assignments' not in st.session_state:
+    st.session_state.assignments = None
+if 'pdf_buffer' not in st.session_state:
+    st.session_state.pdf_buffer = None
+if 'signature_buffer' not in st.session_state:
+    st.session_state.signature_buffer = None
 
-pdf_buffer = None  # Seating PDF buffer
-signature_buffer = None  # Signature sheet buffer
-assignments = None  # Keep the seating assignments globally
+uploaded_file = st.file_uploader("Upload the student list as an Excel file", type=["xlsx"])
 
 if uploaded_file:
     df_students = pd.read_excel(uploaded_file)
@@ -54,6 +58,9 @@ if uploaded_file:
             for cls, capacity in classes.items():
                 assignments[cls] = included_students[index:index+capacity]
                 index += capacity
+
+            # Store assignments in session state
+            st.session_state.assignments = assignments
 
             buffer = BytesIO()
             doc = SimpleDocTemplate(buffer, pagesize=A4)
@@ -97,14 +104,14 @@ if uploaded_file:
 
             doc.build(elements)
             buffer.seek(0)
-            pdf_buffer = buffer
+            st.session_state.pdf_buffer = buffer
             st.success("Seating PDF successfully generated!")
 
         except Exception as e:
             st.error(f"Failed to generate Seating PDF: {e}")
 
     # Show "Generate Signature Sheet" only after seating PDF exists
-    if pdf_buffer and assignments:
+    if st.session_state.pdf_buffer and st.session_state.assignments:
         if st.button("Generate Signature Sheet"):
             try:
                 buffer = BytesIO()
@@ -113,8 +120,8 @@ if uploaded_file:
                 styles = getSampleStyleSheet()
                 first_class = True
 
-                # Use the SAME assignments as seating PDF
-                for cls, student_list in assignments.items():
+                # Use the SAME assignments from session state
+                for cls, student_list in st.session_state.assignments.items():
                     if not first_class:
                         elements.append(PageBreak())
                     first_class = False
@@ -150,23 +157,23 @@ if uploaded_file:
 
                 doc.build(elements)
                 buffer.seek(0)
-                signature_buffer = buffer
+                st.session_state.signature_buffer = buffer
                 st.success("Signature sheet PDF successfully generated!")
             except Exception as e:
                 st.error(f"Failed to generate signature sheet PDF: {e}")
 
     # Download buttons
-    if pdf_buffer:
+    if st.session_state.pdf_buffer:
         st.download_button(
             label="Download Seating PDF",
-            data=pdf_buffer,
+            data=st.session_state.pdf_buffer,
             file_name="exam_seating.pdf",
             mime="application/pdf"
         )
-    if signature_buffer:
+    if st.session_state.signature_buffer:
         st.download_button(
             label="Download Signature Sheet PDF",
-            data=signature_buffer,
+            data=st.session_state.signature_buffer,
             file_name="signature_sheet.pdf",
             mime="application/pdf"
         )
