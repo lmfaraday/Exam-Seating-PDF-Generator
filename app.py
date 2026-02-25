@@ -10,7 +10,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 
 st.title("Exam Seating PDF Generator")
 
-uploaded_file = st.file_uploader("Öğrenci listesini Excel olarak yükleyin", type=["xlsx"])
+uploaded_file = st.file_uploader("Upload the student list as an Excel file", type=["xlsx"])
 
 pdf_buffer = None  # PDF buffer global
 
@@ -20,31 +20,31 @@ if uploaded_file:
     if 'Include?' not in df_students.columns:
         df_students['Include?'] = True
 
-    # Sıralama seçenekleri
+    # Sorting options
     sort_columns = [col for col in df_students.columns if col != "Include?"]
-    sort_column = st.selectbox("Tabloyu hangi sütuna göre sıralamak istersiniz?", sort_columns, index=0)
-    ascending = st.checkbox("Artan sıra", value=True)
+    sort_column = st.selectbox("Which column would you like to sort the table by?", sort_columns, index=0)
+    ascending = st.checkbox("Ascending order", value=True)
 
     df_sorted = df_students.sort_values(by=sort_column, ascending=ascending)
 
-    st.subheader("Öğrenci Önizleme ve Seçim")
+    st.subheader("Student Preview and Selection")
     display_df = df_sorted.drop(columns=['Include?'])
     edited_df = st.data_editor(display_df, num_rows="dynamic")
 
-    id_column = st.text_input("Okul numarası sütun adı", "ID number")
+    id_column = st.text_input("Name of the student ID column", "ID number")
     included_students = df_sorted[df_sorted['Include?'] == True][id_column].dropna().astype(int).astype(str).tolist()
 
-    st.subheader("Sınıf Bilgilerini Girin")
-    class_count = st.number_input("Kaç sınıf var?", min_value=1, max_value=20, value=2, step=1)
+    st.subheader("Enter Classroom Information")
+    class_count = st.number_input("Number of classrooms", min_value=1, max_value=20, value=2, step=1)
     classes = {}
     for i in range(class_count):
-        cls_name = st.text_input(f"Sınıf {i+1} adı", key=f"class_name_{i}")
-        capacity = st.number_input(f"{cls_name} kapasitesi", min_value=1, max_value=500, key=f"capacity_{i}")
+        cls_name = st.text_input(f"Class {i+1} name", key=f"class_name_{i}")
+        capacity = st.number_input(f"{cls_name} capacity", min_value=1, max_value=500, key=f"capacity_{i}")
         if cls_name:
             classes[cls_name] = capacity
 
-    # Planla butonu
-    if st.button("Planla"):
+    # Schedule button
+    if st.button("Generate Seating"):
         try:
             random.shuffle(included_students)
             assignments = {}
@@ -95,15 +95,15 @@ if uploaded_file:
 
             doc.build(elements)
             buffer.seek(0)
-            pdf_buffer = buffer  # PDF buffer global olarak sakla
-            st.success("PDF başarıyla oluşturuldu!")
+            pdf_buffer = buffer  # Save PDF buffer globally
+            st.success("PDF successfully generated!")
         except Exception as e:
-            st.error(f"PDF oluşturulamadı: {e}")
+            st.error(f"Failed to generate PDF: {e}")
 
-    # Eğer PDF başarılı oluşturulduysa indirme butonunu göster
+    # If PDF is successfully created, show the download button
     if pdf_buffer:
         st.download_button(
-            label="PDF İndir",
+            label="Download PDF",
             data=pdf_buffer,
             file_name="exam_seating.pdf",
             mime="application/pdf"
