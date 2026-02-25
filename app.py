@@ -12,8 +12,9 @@ st.title("Exam Seating PDF Generator")
 
 uploaded_file = st.file_uploader("Upload the student list as an Excel file", type=["xlsx"])
 
-pdf_buffer = None  # PDF buffer global
-signature_buffer = None  # Signature sheet buffer global
+pdf_buffer = None  # Seating PDF buffer
+signature_buffer = None  # Signature sheet buffer
+assignments = None  # Keep the assignments globally after seating is generated
 
 if uploaded_file:
     df_students = pd.read_excel(uploaded_file)
@@ -54,7 +55,6 @@ if uploaded_file:
                 assignments[cls] = included_students[index:index+capacity]
                 index += capacity
 
-            # --- Seating PDF ---
             buffer = BytesIO()
             doc = SimpleDocTemplate(buffer, pagesize=A4)
             elements = []
@@ -102,20 +102,10 @@ if uploaded_file:
         except Exception as e:
             st.error(f"Failed to generate Seating PDF: {e}")
 
-    # Generate Signature Sheet PDF
-    if st.button("Generate Signature Sheet"):
-        try:
-            if not included_students:
-                st.warning("No students selected to generate signature sheet.")
-            else:
-                # Use the same shuffled assignments as seating
-                random.shuffle(included_students)
-                assignments = {}
-                index = 0
-                for cls, capacity in classes.items():
-                    assignments[cls] = included_students[index:index+capacity]
-                    index += capacity
-
+    # Show "Generate Signature Sheet" only after seating PDF exists
+    if pdf_buffer and assignments:
+        if st.button("Generate Signature Sheet"):
+            try:
                 buffer = BytesIO()
                 doc = SimpleDocTemplate(buffer, pagesize=A4)
                 elements = []
@@ -160,8 +150,8 @@ if uploaded_file:
                 buffer.seek(0)
                 signature_buffer = buffer
                 st.success("Signature sheet PDF successfully generated!")
-        except Exception as e:
-            st.error(f"Failed to generate signature sheet PDF: {e}")
+            except Exception as e:
+                st.error(f"Failed to generate signature sheet PDF: {e}")
 
     # Download buttons
     if pdf_buffer:
