@@ -7,6 +7,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
+from zipfile import ZipFile
 
 st.title("Exam Seating PDF Generator")
 
@@ -49,8 +50,8 @@ if uploaded_file:
         if cls_name:
             classes[cls_name] = capacity
 
-    # Generate Seating PDF
-    if st.button("Generate Seating"):
+    # Generate Both PDFs
+    if st.button("Generate Seating and Signature Sheet"):
         try:
             random.shuffle(included_students)
             assignments = {}
@@ -62,8 +63,9 @@ if uploaded_file:
             # Store assignments in session state
             st.session_state.assignments = assignments
 
-            buffer = BytesIO()
-            doc = SimpleDocTemplate(buffer, pagesize=A4)
+            # Generate Seating PDF
+            seating_buffer = BytesIO()
+            doc = SimpleDocTemplate(seating_buffer, pagesize=A4)
             elements = []
             styles = getSampleStyleSheet()
             first_class = True
@@ -103,77 +105,70 @@ if uploaded_file:
                 elements.append(Spacer(1, 24))
 
             doc.build(elements)
-            buffer.seek(0)
-            st.session_state.pdf_buffer = buffer
-            st.success("Seating PDF successfully generated!")
+            seating_buffer.seek(0)
+            st.session_state.pdf_buffer = seating_buffer
+
+            # Generate Signature Sheet PDF
+            signature_buffer = BytesIO()
+            doc = SimpleDocTemplate(signature_buffer, pagesize=A4)
+            elements = []
+            first_class = True
+
+            for cls, student_list in assignments.items():
+                if not first_class:
+                    elements.append(PageBreak())
+                first_class = False
+
+                elements.append(Paragraph(f"<b>{cls} - Signature Sheet</b>", styles['Title']))
+                elements.append(Spacer(1, 12))
+
+                half = math.ceil(len(student_list)/2)
+                col1 = student_list[:half]
+                col2 = student_list[half:]
+
+                table_data = [["Seat", "ID", "Signature", "Seat", "ID", "Signature"]]
+                for i in range(half):
+                    row = [str(i+1), col1[i], ""]
+                    if i < len(col2):
+                        row += [str(i+1+half), col2[i], ""]
+                    else:
+                        row += ["", "", ""]
+                    table_data.append(row)
+
+                table = Table(table_data, colWidths=[40, 80, 80, 40, 80, 80])
+                table_style = TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.grey),
+                    ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+                    ('ALIGN',(0,0),(-1,-1),'CENTER'),
+                    ('GRID', (0,0), (-1,-1), 1, colors.black),
+                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                    ('FONTNAME', (0,1), (-1,-1), 'Helvetica')
+                ])
+                table.setStyle(table_style)
+                elements.append(table)
+                elements.append(Spacer(1, 24))
+
+            doc.build(elements)
+            signature_buffer.seek(0)
+            st.session_state.signature_buffer = signature_buffer
+
+            st.success("Both PDFs successfully generated!")
 
         except Exception as e:
-            st.error(f"Failed to generate Seating PDF: {e}")
+            st.error(f"Failed to generate PDFs: {e}")
 
-    # Show "Generate Signature Sheet" only after seating PDF exists
-    if st.session_state.pdf_buffer and st.session_state.assignments:
-        if st.button("Generate Signature Sheet"):
-            try:
-                buffer = BytesIO()
-                doc = SimpleDocTemplate(buffer, pagesize=A4)
-                elements = []
-                styles = getSampleStyleSheet()
-                first_class = True
-
-                # Use the SAME assignments from session state
-                for cls, student_list in st.session_state.assignments.items():
-                    if not first_class:
-                        elements.append(PageBreak())
-                    first_class = False
-
-                    elements.append(Paragraph(f"<b>{cls} - Signature Sheet</b>", styles['Title']))
-                    elements.append(Spacer(1, 12))
-
-                    half = math.ceil(len(student_list)/2)
-                    col1 = student_list[:half]
-                    col2 = student_list[half:]
-
-                    table_data = [["Seat", "ID", "Signature", "Seat", "ID", "Signature"]]
-                    for i in range(half):
-                        row = [str(i+1), col1[i], ""]
-                        if i < len(col2):
-                            row += [str(i+1+half), col2[i], ""]
-                        else:
-                            row += ["", "", ""]
-                        table_data.append(row)
-
-                    table = Table(table_data, colWidths=[40, 80, 80, 40, 80, 80])
-                    table_style = TableStyle([
-                        ('BACKGROUND', (0,0), (-1,0), colors.grey),
-                        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
-                        ('ALIGN',(0,0),(-1,-1),'CENTER'),
-                        ('GRID', (0,0), (-1,-1), 1, colors.black),
-                        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-                        ('FONTNAME', (0,1), (-1,-1), 'Helvetica')
-                    ])
-                    table.setStyle(table_style)
-                    elements.append(table)
-                    elements.append(Spacer(1, 24))
-
-                doc.build(elements)
-                buffer.seek(0)
-                st.session_state.signature_buffer = buffer
-                st.success("Signature sheet PDF successfully generated!")
-            except Exception as e:
-                st.error(f"Failed to generate signature sheet PDF: {e}")
-
-    # Download buttons
-    if st.session_state.pdf_buffer:
+    # Single Download button for both PDFs in a ZIP file
+    if st.session_state.pdf_buffer and st.session_state.signature_buffer:
+        # Create ZIP file containing both PDFs
+        zip_buffer = BytesIO()
+        with ZipFile(zip_buffer, 'w') as zip_file:
+            zip_file.writestr("exam_seating.pdf", st.session_state.pdf_buffer.getvalue())
+            zip_file.writestr("signature_sheet.pdf", st.session_state.signature_buffer.getvalue())
+        zip_buffer.seek(0)
+        
         st.download_button(
-            label="Download Seating PDF",
-            data=st.session_state.pdf_buffer,
-            file_name="exam_seating.pdf",
-            mime="application/pdf"
-        )
-    if st.session_state.signature_buffer:
-        st.download_button(
-            label="Download Signature Sheet PDF",
-            data=st.session_state.signature_buffer,
-            file_name="signature_sheet.pdf",
-            mime="application/pdf"
+            label="Download Both PDFs (ZIP)",
+            data=zip_buffer,
+            file_name="exam_documents.zip",
+            mime="application/zip"
         )
