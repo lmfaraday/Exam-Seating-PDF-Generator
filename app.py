@@ -14,7 +14,7 @@ uploaded_file = st.file_uploader("Upload the student list as an Excel file", typ
 
 pdf_buffer = None  # Seating PDF buffer
 signature_buffer = None  # Signature sheet buffer
-assignments = None  # Keep the assignments globally after seating is generated
+assignments = None  # Keep the seating assignments globally
 
 if uploaded_file:
     df_students = pd.read_excel(uploaded_file)
@@ -99,6 +99,7 @@ if uploaded_file:
             buffer.seek(0)
             pdf_buffer = buffer
             st.success("Seating PDF successfully generated!")
+
         except Exception as e:
             st.error(f"Failed to generate Seating PDF: {e}")
 
@@ -112,6 +113,7 @@ if uploaded_file:
                 styles = getSampleStyleSheet()
                 first_class = True
 
+                # Use the SAME assignments as seating PDF
                 for cls, student_list in assignments.items():
                     if not first_class:
                         elements.append(PageBreak())
