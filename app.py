@@ -54,11 +54,24 @@ if uploaded_file:
     if st.button("Generate Seating"):
         try:
             random.shuffle(included_students)
+            
+            # Calculate proportional distribution
+            total_capacity = sum(classes.values())
+            total_students = len(included_students)
+            
             assignments = {}
             index = 0
-            for cls, capacity in classes.items():
-                assignments[cls] = included_students[index:index+capacity]
-                index += capacity
+            
+            # Distribute students proportionally based on classroom capacity
+            for i, (cls, capacity) in enumerate(classes.items()):
+                if i == len(classes) - 1:  # Last classroom gets remaining students
+                    assignments[cls] = included_students[index:]
+                else:
+                    # Calculate proportional share
+                    proportion = capacity / total_capacity
+                    num_students = round(total_students * proportion)
+                    assignments[cls] = included_students[index:index+num_students]
+                    index += num_students
 
             # Store assignments in session state
             st.session_state.assignments = assignments
@@ -153,6 +166,11 @@ if uploaded_file:
             st.session_state.signature_buffer = signature_buffer
 
             st.success("Seating plan and signature sheet successfully generated!")
+            
+            # Show distribution info
+            st.info("Distribution:")
+            for cls, student_list in assignments.items():
+                st.write(f"{cls}: {len(student_list)} students")
 
         except Exception as e:
             st.error(f"Failed to generate PDFs: {e}")
