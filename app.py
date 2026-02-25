@@ -50,8 +50,8 @@ if uploaded_file:
         if cls_name:
             classes[cls_name] = capacity
 
-    # Generate Both PDFs
-    if st.button("Generate Seating and Signature Sheet"):
+    # Generate Seating - creates both PDFs at once
+    if st.button("Generate Seating"):
         try:
             random.shuffle(included_students)
             assignments = {}
@@ -152,7 +152,7 @@ if uploaded_file:
             signature_buffer.seek(0)
             st.session_state.signature_buffer = signature_buffer
 
-            st.success("Both PDFs successfully generated!")
+            st.success("Seating plan and signature sheet successfully generated!")
 
         except Exception as e:
             st.error(f"Failed to generate PDFs: {e}")
@@ -167,7 +167,7 @@ if uploaded_file:
         zip_buffer.seek(0)
         
         st.download_button(
-            label="Download Both PDFs (ZIP)",
+            label="Download Seating Plan & Signature Sheet",
             data=zip_buffer,
             file_name="exam_documents.zip",
             mime="application/zip"
