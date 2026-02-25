@@ -13,6 +13,7 @@ st.title("Exam Seating PDF Generator")
 uploaded_file = st.file_uploader("Upload the student list as an Excel file", type=["xlsx"])
 
 pdf_buffer = None  # PDF buffer global
+signature_buffer = None  # Signature sheet buffer global
 
 if uploaded_file:
     df_students = pd.read_excel(uploaded_file)
@@ -43,7 +44,7 @@ if uploaded_file:
         if cls_name:
             classes[cls_name] = capacity
 
-    # Schedule button
+    # Generate Seating PDF
     if st.button("Generate Seating"):
         try:
             random.shuffle(included_students)
@@ -53,6 +54,7 @@ if uploaded_file:
                 assignments[cls] = included_students[index:index+capacity]
                 index += capacity
 
+            # --- Seating PDF ---
             buffer = BytesIO()
             doc = SimpleDocTemplate(buffer, pagesize=A4)
             elements = []
@@ -95,16 +97,84 @@ if uploaded_file:
 
             doc.build(elements)
             buffer.seek(0)
-            pdf_buffer = buffer  # Save PDF buffer globally
-            st.success("PDF successfully generated!")
+            pdf_buffer = buffer
+            st.success("Seating PDF successfully generated!")
         except Exception as e:
-            st.error(f"Failed to generate PDF: {e}")
+            st.error(f"Failed to generate Seating PDF: {e}")
 
-    # If PDF is successfully created, show the download button
+    # Generate Signature Sheet PDF
+    if st.button("Generate Signature Sheet"):
+        try:
+            if not included_students:
+                st.warning("No students selected to generate signature sheet.")
+            else:
+                # Use the same shuffled assignments as seating
+                random.shuffle(included_students)
+                assignments = {}
+                index = 0
+                for cls, capacity in classes.items():
+                    assignments[cls] = included_students[index:index+capacity]
+                    index += capacity
+
+                buffer = BytesIO()
+                doc = SimpleDocTemplate(buffer, pagesize=A4)
+                elements = []
+                styles = getSampleStyleSheet()
+                first_class = True
+
+                for cls, student_list in assignments.items():
+                    if not first_class:
+                        elements.append(PageBreak())
+                    first_class = False
+
+                    elements.append(Paragraph(f"<b>{cls} - Signature Sheet</b>", styles['Title']))
+                    elements.append(Spacer(1, 12))
+
+                    half = math.ceil(len(student_list)/2)
+                    col1 = student_list[:half]
+                    col2 = student_list[half:]
+
+                    table_data = [["Seat", "ID", "Signature", "Seat", "ID", "Signature"]]
+                    for i in range(half):
+                        row = [str(i+1), col1[i], ""]
+                        if i < len(col2):
+                            row += [str(i+1+half), col2[i], ""]
+                        else:
+                            row += ["", "", ""]
+                        table_data.append(row)
+
+                    table = Table(table_data, colWidths=[40, 80, 80, 40, 80, 80])
+                    table_style = TableStyle([
+                        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+                        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+                        ('ALIGN',(0,0),(-1,-1),'CENTER'),
+                        ('GRID', (0,0), (-1,-1), 1, colors.black),
+                        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                        ('FONTNAME', (0,1), (-1,-1), 'Helvetica')
+                    ])
+                    table.setStyle(table_style)
+                    elements.append(table)
+                    elements.append(Spacer(1, 24))
+
+                doc.build(elements)
+                buffer.seek(0)
+                signature_buffer = buffer
+                st.success("Signature sheet PDF successfully generated!")
+        except Exception as e:
+            st.error(f"Failed to generate signature sheet PDF: {e}")
+
+    # Download buttons
     if pdf_buffer:
         st.download_button(
-            label="Download PDF",
+            label="Download Seating PDF",
             data=pdf_buffer,
             file_name="exam_seating.pdf",
+            mime="application/pdf"
+        )
+    if signature_buffer:
+        st.download_button(
+            label="Download Signature Sheet PDF",
+            data=signature_buffer,
+            file_name="signature_sheet.pdf",
             mime="application/pdf"
         )
