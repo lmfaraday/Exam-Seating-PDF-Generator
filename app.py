@@ -115,24 +115,29 @@ raw_data_cols = [col for col in df_raw.columns if col != "Include?"]
 # ── Step 2: Student Preview & Settings ───────────────────────────────────────
 with st.expander("Step 2 – Student Preview & Settings", expanded=True):
 
-    # --- Combined column ---
-    combine_on = st.checkbox("Create a combined column (e.g. Full Name)")
-    combined_col_name = None
-    if combine_on:
-        cc1, cc2, cc3, cc4 = st.columns([2, 2, 2, 1])
-        col_a = cc1.selectbox("First column", raw_data_cols, key="ca")
-        col_b = cc2.selectbox("Second column", raw_data_cols,
-                               index=min(1, len(raw_data_cols)-1), key="cb")
-        combined_col_name = cc3.text_input("New column name", "Full Name")
-        separator = cc4.text_input("Separator", " ")
+    # --- Name - Surname combined column ---
+    def _default_index(cols, candidates):
+        for c in candidates:
+            if c in cols:
+                return cols.index(c)
+        return 0
+
+    cc1, cc2 = st.columns(2)
+    name_col_a = cc1.selectbox(
+        "Name column", raw_data_cols,
+        index=_default_index(raw_data_cols, ["First name", "first name", "Ad", "Name"])
+    )
+    name_col_b = cc2.selectbox(
+        "Surname column", raw_data_cols,
+        index=_default_index(raw_data_cols, ["Last name", "last name", "Soyad", "Surname"])
+    )
 
     # Apply combined column to dataframe
     df_work = df_raw.copy()
-    if combine_on and combined_col_name:
-        df_work.insert(
-            1, combined_col_name,
-            df_work[col_a].astype(str) + separator + df_work[col_b].astype(str)
-        )
+    df_work.insert(
+        1, "Name - Surname",
+        df_work[name_col_a].astype(str) + " " + df_work[name_col_b].astype(str)
+    )
 
     data_cols = [col for col in df_work.columns if col != "Include?"]
 
@@ -150,11 +155,13 @@ with st.expander("Step 2 – Student Preview & Settings", expanded=True):
 
     # --- Editable student table with Include? checkbox ---
     st.markdown('<p class="section-label">Select students to include</p>', unsafe_allow_html=True)
-    display_order = ['Include?'] + data_cols
+    hidden_cols = {c for c in data_cols if c.lower().startswith("group")}
+    hidden_col_config = {c: None for c in hidden_cols}
     edited_df = st.data_editor(
-        df_sorted[display_order],
+        df_sorted[['Include?'] + data_cols],
         column_config={
-            "Include?": st.column_config.CheckboxColumn("Include?", default=True, width="small")
+            "Include?": st.column_config.CheckboxColumn("Include?", default=True, width="small"),
+            **hidden_col_config,
         },
         disabled=data_cols,
         use_container_width=True,
