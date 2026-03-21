@@ -15,8 +15,6 @@ Workflow:
 import math
 import os
 import random
-import tempfile
-import urllib.request
 from io import BytesIO
 from zipfile import ZipFile
 
@@ -37,17 +35,22 @@ from reportlab.platypus import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Helvetica (ReportLab built-in) does not support Turkish characters (İ, Ş, Ğ, …).
-# We try system fonts first, then download DejaVu Sans as a guaranteed fallback.
+# DejaVu Sans is bundled in the fonts/ directory alongside this script for full Unicode support.
+# System fonts are tried first; the bundled fonts are the guaranteed fallback.
 
-_SYSTEM_FONT_CANDIDATES = {
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_FONT_CANDIDATES = {
     "regular": [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",        # Linux / Streamlit Cloud
+        os.path.join(_SCRIPT_DIR, "fonts", "DejaVuSans.ttf"),     # bundled (always present)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",         # Linux / Streamlit Cloud
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/Library/Fonts/Arial.ttf",                                # macOS (if Office installed)
+        "/Library/Fonts/Arial.ttf",                                # macOS
         "/System/Library/Fonts/Supplemental/Arial.ttf",
     ],
     "bold": [
+        os.path.join(_SCRIPT_DIR, "fonts", "DejaVuSans-Bold.ttf"), # bundled
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -56,61 +59,31 @@ _SYSTEM_FONT_CANDIDATES = {
     ],
 }
 
-_DEJAVU_BASE = (
-    "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf/"
-)
-
-
-def _ensure_dejavu_fonts() -> tuple[str | None, str | None]:
-    """Download DejaVu Sans to a temp dir if not already cached. Returns (reg_path, bold_path)."""
-    tmp = tempfile.gettempdir()
-    files = {"regular": "DejaVuSans.ttf", "bold": "DejaVuSans-Bold.ttf"}
-    paths = {}
-    for variant, filename in files.items():
-        dest = os.path.join(tmp, filename)
-        if not os.path.exists(dest):
-            try:
-                urllib.request.urlretrieve(_DEJAVU_BASE + filename, dest)
-            except Exception:
-                dest = None
-        paths[variant] = dest if dest and os.path.exists(str(dest)) else None
-    return paths["regular"], paths["bold"]
-
 
 def _register_unicode_fonts() -> tuple[str, str]:
     """Register a Unicode TTF font that covers Turkish characters.
 
-    Search order:
-    1. Known system font paths (fast, no network).
-    2. Download DejaVu Sans from GitHub (once, cached in /tmp).
-    3. Fall back to Helvetica with a warning (Turkish chars will render as boxes).
+    Tries candidates in order; the bundled DejaVu Sans is listed first so it
+    is always found even when no system fonts are available.
     """
     reg, bold = "Helvetica", "Helvetica-Bold"
 
-    def _try_register(path: str, name: str) -> bool:
+    def _try(path: str, name: str) -> bool:
         try:
             pdfmetrics.registerFont(TTFont(name, path))
             return True
         except Exception:
             return False
 
-    for path in _SYSTEM_FONT_CANDIDATES["regular"]:
-        if os.path.exists(path) and _try_register(path, "UniFont"):
+    for path in _FONT_CANDIDATES["regular"]:
+        if os.path.exists(path) and _try(path, "UniFont"):
             reg = "UniFont"
             break
 
-    for path in _SYSTEM_FONT_CANDIDATES["bold"]:
-        if os.path.exists(path) and _try_register(path, "UniFont-Bold"):
+    for path in _FONT_CANDIDATES["bold"]:
+        if os.path.exists(path) and _try(path, "UniFont-Bold"):
             bold = "UniFont-Bold"
             break
-
-    # If either variant is still missing, try downloading DejaVu
-    if reg == "Helvetica" or bold == "Helvetica-Bold":
-        dv_reg, dv_bold = _ensure_dejavu_fonts()
-        if reg == "Helvetica" and dv_reg and _try_register(dv_reg, "UniFont"):
-            reg = "UniFont"
-        if bold == "Helvetica-Bold" and dv_bold and _try_register(dv_bold, "UniFont-Bold"):
-            bold = "UniFont-Bold"
 
     return reg, bold
 
