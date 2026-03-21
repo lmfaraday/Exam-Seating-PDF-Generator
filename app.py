@@ -50,28 +50,48 @@ if uploaded_file:
         if cls_name:
             classes[cls_name] = capacity
 
+    seating_mode = st.radio(
+        "Seating mode",
+        ["Completely Random", "Alphabetically Split, then Random"]
+    )
+
+    if seating_mode == "Alphabetically Split, then Random":
+        name_column = st.text_input("Name column to sort alphabetically by", "Name")
+
     # Generate Seating - creates both PDFs at once
     if st.button("Generate Seating"):
         try:
-            random.shuffle(included_students)
-            
-            # Calculate proportional distribution
             total_capacity = sum(classes.values())
-            total_students = len(included_students)
-            
             assignments = {}
             index = 0
-            
-            # Distribute students proportionally based on classroom capacity
-            for i, (cls, capacity) in enumerate(classes.items()):
-                if i == len(classes) - 1:  # Last classroom gets remaining students
-                    assignments[cls] = included_students[index:]
-                else:
-                    # Calculate proportional share
-                    proportion = capacity / total_capacity
-                    num_students = round(total_students * proportion)
-                    assignments[cls] = included_students[index:index+num_students]
-                    index += num_students
+
+            if seating_mode == "Completely Random":
+                random.shuffle(included_students)
+                total_students = len(included_students)
+                for i, (cls, capacity) in enumerate(classes.items()):
+                    if i == len(classes) - 1:
+                        assignments[cls] = included_students[index:]
+                    else:
+                        proportion = capacity / total_capacity
+                        num_students = round(total_students * proportion)
+                        assignments[cls] = included_students[index:index+num_students]
+                        index += num_students
+            else:
+                # Sort students alphabetically by name column, split proportionally, shuffle within each room
+                included_df = df_sorted[df_sorted['Include?'] == True].copy()
+                included_df = included_df.sort_values(by=name_column)
+                included_students_sorted = included_df[id_column].dropna().astype(int).astype(str).tolist()
+                total_students = len(included_students_sorted)
+                for i, (cls, capacity) in enumerate(classes.items()):
+                    if i == len(classes) - 1:
+                        group = included_students_sorted[index:]
+                    else:
+                        proportion = capacity / total_capacity
+                        num_students = round(total_students * proportion)
+                        group = included_students_sorted[index:index+num_students]
+                        index += num_students
+                    random.shuffle(group)
+                    assignments[cls] = group
 
             # Store assignments in session state
             st.session_state.assignments = assignments
