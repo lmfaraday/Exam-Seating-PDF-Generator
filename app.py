@@ -1,100 +1,462 @@
-import streamlit as st
-import pandas as pd
-import random
+"""
+Exam Seating Generator
+======================
+Streamlit app for teaching assistants to generate exam seating plans
+and student signature sheets from an Excel student list.
+
+Workflow:
+  1. Upload an Excel file with student data
+  2. Configure columns, classrooms, and seating mode
+  3. Generate and download a ZIP with two PDFs:
+       - exam_seating.pdf    : seat assignments per classroom
+       - signature_sheet.pdf : same layout with a blank Signature column
+"""
+
 import math
+import os
+import random
 from io import BytesIO
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
 from zipfile import ZipFile
+
+import pandas as pd
+import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fonts
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Helvetica (ReportLab's built-in) does not support Turkish characters.
+# We register the first available Unicode TTF font as a drop-in replacement.
+_UNICODE_FONT_CANDIDATES = {
+    "regular": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",       # Linux / Streamlit Cloud
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/Library/Fonts/Arial.ttf",                               # macOS
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ],
+    "bold": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ],
+}
+
+
+def _register_unicode_fonts() -> tuple[str, str]:
+    """Try to register a Unicode TTF font for PDF output.
+
+    Returns (regular_name, bold_name) for use in ReportLab styles.
+    Falls back to the built-in Helvetica if no suitable font is found.
+    """
+    reg, bold = "Helvetica", "Helvetica-Bold"
+    for path in _UNICODE_FONT_CANDIDATES["regular"]:
+        if os.path.exists(path):
+            pdfmetrics.registerFont(TTFont("UniFont", path))
+            reg = "UniFont"
+            break
+    for path in _UNICODE_FONT_CANDIDATES["bold"]:
+        if os.path.exists(path):
+            pdfmetrics.registerFont(TTFont("UniFont-Bold", path))
+            bold = "UniFont-Bold"
+            break
+    return reg, bold
+
+
+FONT_REG, FONT_BOLD = _register_unicode_fonts()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def to_id_str(value) -> str:
+    """Convert a cell value to a clean string student ID.
+
+    Pandas reads integer IDs as floats (e.g. 2022401234.0).
+    This strips the decimal point. Returns "" for NaN / None.
+    """
+    if pd.isna(value):
+        return ""
+    return str(int(value)) if isinstance(value, float) else str(value)
+
+
+def first_match_index(options: list, candidates: list) -> int:
+    """Return the index of the first candidate found in options, or 0."""
+    for c in candidates:
+        if c in options:
+            return options.index(c)
+    return 0
+
+
+def find_duplicates(values: list) -> set:
+    """Return the set of values that appear more than once in the list."""
+    seen, dupes = set(), set()
+    for v in values:
+        (dupes if v in seen else seen).add(v)
+    return dupes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_hard_errors(
+    classes: dict,
+    included_students: list,
+    seating_cols: list,
+    sig_cols: list,
+) -> list[str]:
+    """Return error messages that must block PDF generation."""
+    errors = []
+
+    if not classes:
+        errors.append("Enter at least one classroom name.")
+    if not included_students:
+        errors.append("No students are included.")
+    if not seating_cols:
+        errors.append("Select at least one column for the Seating Plan.")
+    if not sig_cols:
+        errors.append("Select at least one column for the Signature Sheet.")
+
+    if classes and included_students:
+        total_cap = sum(classes.values())
+        n = len(included_students)
+        if total_cap < n:
+            errors.append(
+                f"Total classroom capacity ({total_cap}) is less than the number of "
+                f"included students ({n}). Increase capacity or exclude some students."
+            )
+
+        dupes = find_duplicates(included_students)
+        if dupes:
+            errors.append(
+                f"Duplicate student IDs found: {', '.join(sorted(dupes))}. "
+                "Each student must appear only once."
+            )
+
+    return errors
+
+
+def get_soft_warnings(assignments: dict, classes: dict) -> list[str]:
+    """Return warning messages about unusual but non-fatal assignment results."""
+    warnings = []
+    for cls, students in assignments.items():
+        n, cap = len(students), classes[cls]
+        if n == 0:
+            warnings.append(
+                f"**{cls}** received 0 students. "
+                "Consider removing this classroom or reducing the classroom count."
+            )
+        elif n > cap:
+            warnings.append(
+                f"**{cls}** has {n} students but a capacity of {cap}. "
+                "Some students may not have a seat."
+            )
+    return warnings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Seating assignment
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _split_proportionally(students: list, classes: dict) -> dict[str, list]:
+    """Distribute students across classrooms proportional to each room's capacity.
+
+    The last classroom absorbs any rounding remainder so no student is lost.
+    """
+    total_cap = sum(classes.values())
+    total_stu = len(students)
+    assignments = {}
+    cursor = 0
+
+    for i, (cls, cap) in enumerate(classes.items()):
+        if i == len(classes) - 1:               # last room gets the remainder
+            assignments[cls] = students[cursor:]
+        else:
+            count = round(total_stu * cap / total_cap)
+            assignments[cls] = students[cursor:cursor + count]
+            cursor += count
+
+    return assignments
+
+
+def assign_randomly(students: list, classes: dict, seed: int | None = None) -> dict[str, list]:
+    """(Mode A) Shuffle all students, then distribute proportionally by room capacity.
+
+    Args:
+        seed: Optional integer seed for reproducible assignments.
+    """
+    pool = students[:]
+    rng = random.Random(seed)
+    rng.shuffle(pool)
+    return _split_proportionally(pool, classes)
+
+
+def assign_alphabetically(
+    students: list,
+    classes: dict,
+    df_lookup: pd.DataFrame,
+    sort_col: str,
+    ascending: bool = True,
+) -> dict[str, list]:
+    """(Mode B) Sort students by a chosen column, split proportionally, shuffle within rooms.
+
+    Alphabetical grouping gives each room a distinct name range (A–F, G–N, …)
+    while seat positions within each room remain randomised.
+
+    Args:
+        ascending: Sort A→Z when True, Z→A when False.
+    """
+    id_to_sort_key = dict(zip(df_lookup["_id_str"], df_lookup[sort_col].astype(str)))
+    sorted_students = sorted(
+        students,
+        key=lambda sid: id_to_sort_key.get(sid, ""),
+        reverse=not ascending,
+    )
+    assignments = _split_proportionally(sorted_students, classes)
+    for cls in assignments:
+        random.shuffle(assignments[cls])
+    return assignments
+
+
+def assign_stratified(
+    students: list,
+    classes: dict,
+    df_lookup: pd.DataFrame,
+    group_col: str,
+) -> dict[str, list]:
+    """(Mode F) Stratified assignment — every room gets a proportional share of each group.
+
+    Students are first separated by their group value.  Within each group they
+    are shuffled, then distributed proportionally across rooms (same algorithm
+    as Mode A but applied per-group).  This guarantees that no single group is
+    concentrated in one room.
+
+    Students with a missing / blank group value are treated as their own group.
+    """
+    id_to_group = dict(zip(df_lookup["_id_str"], df_lookup[group_col].astype(str)))
+
+    # Bucket students by group, shuffle within each bucket
+    buckets: dict[str, list] = {}
+    for sid in students:
+        grp = id_to_group.get(sid, "")
+        buckets.setdefault(grp, []).append(sid)
+    for grp in buckets:
+        random.shuffle(buckets[grp])
+
+    # Distribute each group proportionally across rooms, then merge
+    assignments: dict[str, list] = {cls: [] for cls in classes}
+    for grp_students in buckets.values():
+        grp_assignments = _split_proportionally(grp_students, classes)
+        for cls, grp_slice in grp_assignments.items():
+            assignments[cls].extend(grp_slice)
+
+    # Shuffle final seat order within each room so groups are not visually clustered
+    for cls in assignments:
+        random.shuffle(assignments[cls])
+
+    return assignments
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PAGE_W  = A4[0] - 80   # usable width in points (~515 pt with 40 pt side margins)
+_SEAT_W  = 32            # fixed width of the "Seat" number column
+_SIG_W   = 62            # fixed width of the "Signature" column
+
+
+def _make_table_style(n_left_cols: int, row_height: int) -> TableStyle:
+    """Return a plain black-and-white table style.
+
+    n_left_cols determines where the thick vertical divider is drawn between
+    the left and right student halves on each page.
+    """
+    return TableStyle([
+        ("ALIGN",    (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",   (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID",     (0, 0), (-1, -1), 0.5, colors.black),
+        ("FONTNAME", (0, 0), (-1,  0), FONT_BOLD),
+        ("FONTSIZE", (0, 0), (-1,  0), 9),
+        ("FONTNAME", (0, 1), (-1, -1), FONT_REG),
+        ("FONTSIZE", (0, 1), (-1, -1), 8),
+        ("LINEAFTER", (n_left_cols - 1, 0), (n_left_cols - 1, -1), 2, colors.black),
+        ("ROWHEIGHT", (0, 0), (-1, -1), row_height),
+    ])
+
+
+def _make_title_style() -> ParagraphStyle:
+    return ParagraphStyle("ExamTitle", parent=getSampleStyleSheet()["Title"], fontName=FONT_BOLD)
+
+
+def _compute_col_widths(n_data_cols: int, include_signature: bool) -> list[float]:
+    """Calculate column widths so both halves fill the page evenly.
+
+    Layout per half:  [Seat | data cols... | (Signature)]
+    """
+    sig_space = _SIG_W if include_signature else 0
+    data_w = max((_PAGE_W / 2 - _SEAT_W - sig_space) / n_data_cols, 38)
+    one_half = [_SEAT_W] + [data_w] * n_data_cols + ([_SIG_W] if include_signature else [])
+    return one_half * 2   # repeated for left and right halves
+
+
+def _lookup_student_values(df_lookup: pd.DataFrame, student_id: str, columns: list) -> list:
+    """Return column values for one student from the lookup dataframe."""
+    row = df_lookup[df_lookup["_id_str"] == student_id]
+    if row.empty:
+        return [""] * len(columns)
+    return [str(row.iloc[0][col]) for col in columns]
+
+
+def _build_table_data(
+    students: list,
+    data_cols: list,
+    df_lookup: pd.DataFrame,
+    include_signature: bool,
+) -> list[list]:
+    """Build all rows (header + data) for a two-halves-per-page layout.
+
+    The page is split into left and right halves. Each half shows:
+        Seat | data_cols... | [Signature]
+    """
+    sig = ["Signature"] if include_signature else []
+    half = math.ceil(len(students) / 2)
+    left_half, right_half = students[:half], students[half:]
+    n_data = len(data_cols)
+
+    header = ["Seat"] + data_cols + sig + ["Seat"] + data_cols + sig
+    rows = [header]
+
+    for i in range(half):
+        left  = [str(i + 1)]        + _lookup_student_values(df_lookup, left_half[i],  data_cols) + [""] * len(sig)
+        right = ([str(i + 1 + half)] + _lookup_student_values(df_lookup, right_half[i], data_cols) + [""] * len(sig)
+                 if i < len(right_half) else [""] * (1 + n_data + len(sig)))
+        rows.append(left + right)
+
+    return rows
+
+
+def _build_pdf(
+    assignments: dict,
+    columns: list,
+    df_lookup: pd.DataFrame,
+    include_signature: bool,
+) -> BytesIO:
+    """Core PDF builder used by both the seating plan and signature sheet."""
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40)
+    title_style = _make_title_style()
+
+    col_widths  = _compute_col_widths(len(columns), include_signature)
+    n_left_cols = 1 + len(columns) + (1 if include_signature else 0)
+    row_height  = 22 if include_signature else 16
+
+    elements = []
+    for i, (classroom, students) in enumerate(assignments.items()):
+        if i > 0:
+            elements.append(PageBreak())
+
+        heading = f"<b>{classroom}{' – Signature Sheet' if include_signature else ''}</b>"
+        elements.append(Paragraph(heading, title_style))
+        elements.append(Spacer(1, 10))
+
+        table_data = _build_table_data(students, columns, df_lookup, include_signature)
+        table = Table(table_data, colWidths=col_widths)
+        table.setStyle(_make_table_style(n_left_cols, row_height))
+        elements.append(table)
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf
+
+
+def build_seating_pdf(assignments: dict, columns: list, df_lookup: pd.DataFrame) -> BytesIO:
+    """Generate the seating plan PDF (seat numbers + selected columns)."""
+    return _build_pdf(assignments, columns, df_lookup, include_signature=False)
+
+
+def build_signature_pdf(assignments: dict, columns: list, df_lookup: pd.DataFrame) -> BytesIO:
+    """Generate the signature sheet PDF (same as seating plan + blank Signature column)."""
+    return _build_pdf(assignments, columns, df_lookup, include_signature=True)
+
+
+def build_zip(seating_buf: BytesIO, signature_buf: BytesIO) -> BytesIO:
+    """Pack both PDFs into a single ZIP archive for download."""
+    zip_buf = BytesIO()
+    with ZipFile(zip_buf, "w") as zf:
+        zf.writestr("exam_seating.pdf",    seating_buf.getvalue())
+        zf.writestr("signature_sheet.pdf", signature_buf.getvalue())
+    zip_buf.seek(0)
+    return zip_buf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Exam Seating Generator", layout="wide")
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Page title */
 h1 { color: #63b3ed; font-size: 2rem !important; margin-bottom: 0.25rem !important; }
 
-/* Expander border + rounded corners */
 [data-testid="stExpander"] > details {
-    border: 1px solid rgba(99,179,237,0.25);
-    border-radius: 10px;
-    margin-bottom: 0.75rem;
-    background: rgba(26,32,44,0.3);
+    border: 1px solid rgba(99,179,237,0.25); border-radius: 10px;
+    margin-bottom: 0.75rem; background: rgba(26,32,44,0.3);
 }
 [data-testid="stExpander"] > details > summary {
-    font-size: 1rem;
-    font-weight: 600;
-    color: #90cdf4;
-    padding: 0.6rem 1rem;
+    font-size: 1rem; font-weight: 600; color: #90cdf4; padding: 0.6rem 1rem;
 }
 [data-testid="stExpander"] > details > summary:hover { color: #bee3f8; }
 
-/* Section headers inside expanders */
 .section-label {
-    font-size: 0.78rem;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: #63b3ed;
-    margin-bottom: 0.25rem;
+    font-size: 0.78rem; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase; color: #63b3ed; margin-bottom: 0.25rem;
 }
-
-/* Primary generate button */
 .stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, #2b6cb0, #3182ce);
-    color: white;
-    border: none;
-    border-radius: 8px;
-    font-size: 1.1rem;
-    font-weight: 700;
-    padding: 0.7rem 1rem;
-    transition: all 0.2s ease;
+    background: linear-gradient(135deg, #2b6cb0, #3182ce); color: white;
+    border: none; border-radius: 8px; font-size: 1.1rem; font-weight: 700;
+    padding: 0.7rem 1rem; transition: all 0.2s ease;
 }
 .stButton > button[kind="primary"]:hover {
     background: linear-gradient(135deg, #3182ce, #4299e1);
-    box-shadow: 0 4px 18px rgba(49,130,206,0.45);
-    transform: translateY(-1px);
+    box-shadow: 0 4px 18px rgba(49,130,206,0.45); transform: translateY(-1px);
 }
-
-/* Download button */
 .stDownloadButton > button {
     background: linear-gradient(135deg, #276749, #38a169) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-size: 1.05rem !important;
-    font-weight: 600 !important;
-    transition: all 0.2s ease !important;
+    color: white !important; border: none !important; border-radius: 8px !important;
+    font-size: 1.05rem !important; font-weight: 600 !important; transition: all 0.2s ease !important;
 }
 .stDownloadButton > button:hover {
     background: linear-gradient(135deg, #38a169, #48bb78) !important;
-    box-shadow: 0 4px 18px rgba(56,161,105,0.4) !important;
-    transform: translateY(-1px) !important;
+    box-shadow: 0 4px 18px rgba(56,161,105,0.4) !important; transform: translateY(-1px) !important;
 }
-
-/* Metric cards */
 [data-testid="stMetric"] {
-    background: rgba(49,130,206,0.12);
-    border: 1px solid rgba(99,179,237,0.3);
-    border-radius: 8px;
-    padding: 0.6rem 1rem;
+    background: rgba(49,130,206,0.12); border: 1px solid rgba(99,179,237,0.3);
+    border-radius: 8px; padding: 0.6rem 1rem;
 }
 [data-testid="stMetricValue"] { color: #90cdf4 !important; font-weight: 700; }
-
-/* Success / info alerts */
 [data-testid="stAlert"] { border-radius: 8px; }
-
-/* Divider */
 hr { border-color: rgba(99,179,237,0.2) !important; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("Exam Seating Generator")
 
-for key in ['pdf_buffer', 'signature_buffer']:
+for key in ["pdf_buffer", "signature_buffer"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -107,299 +469,171 @@ if not uploaded_file:
     st.stop()
 
 df_raw = pd.read_excel(uploaded_file)
-if 'Include?' not in df_raw.columns:
-    df_raw.insert(0, 'Include?', True)
+if "Include?" not in df_raw.columns:
+    df_raw.insert(0, "Include?", True)
 
-raw_data_cols = [col for col in df_raw.columns if col != "Include?"]
+raw_cols = [col for col in df_raw.columns if col != "Include?"]
 
-# ── Step 2: Student Preview & Settings ───────────────────────────────────────
+# ── Step 2: Students ──────────────────────────────────────────────────────────
 with st.expander("Step 2 – Student Preview & Settings", expanded=True):
 
-    # --- Name - Surname combined column ---
-    def _default_index(cols, candidates):
-        for c in candidates:
-            if c in cols:
-                return cols.index(c)
-        return 0
+    # Always create a "Name - Surname" column; let the user choose the source columns.
+    c1, c2 = st.columns(2)
+    name_col    = c1.selectbox("First name column", raw_cols, index=first_match_index(raw_cols, ["First name", "first name", "Ad", "Name"]))
+    surname_col = c2.selectbox("Last name column",  raw_cols, index=first_match_index(raw_cols, ["Last name", "last name", "Soyad", "Surname"]))
 
-    cc1, cc2 = st.columns(2)
-    name_col_a = cc1.selectbox(
-        "Name column", raw_data_cols,
-        index=_default_index(raw_data_cols, ["First name", "first name", "Ad", "Name"])
-    )
-    name_col_b = cc2.selectbox(
-        "Surname column", raw_data_cols,
-        index=_default_index(raw_data_cols, ["Last name", "last name", "Soyad", "Surname"])
-    )
-
-    # Apply combined column to dataframe
     df_work = df_raw.copy()
-    df_work.insert(
-        1, "Name - Surname",
-        df_work[name_col_a].astype(str) + " " + df_work[name_col_b].astype(str)
-    )
+    df_work.insert(1, "Name - Surname", df_work[name_col].astype(str) + " " + df_work[surname_col].astype(str))
+    all_cols = [col for col in df_work.columns if col != "Include?"]
 
-    data_cols = [col for col in df_work.columns if col != "Include?"]
+    c1, c2, c3 = st.columns(3)
+    id_col    = c1.selectbox("Student ID column", all_cols, index=first_match_index(all_cols, ["ID number", "id", "ID"]))
+    sort_col  = c2.selectbox("Sort preview by",   all_cols)
+    ascending = c3.checkbox("Ascending order", value=True)
 
-    # --- Sort & ID column ---
-    sc1, sc2, sc3 = st.columns(3)
-    with sc1:
-        id_column = st.selectbox("Student ID column", data_cols,
-                                  index=data_cols.index("ID number") if "ID number" in data_cols else 0)
-    with sc2:
-        sort_column = st.selectbox("Sort preview by", data_cols)
-    with sc3:
-        ascending = st.checkbox("Ascending order", value=True)
+    df_sorted = df_work.sort_values(by=sort_col, ascending=ascending).reset_index(drop=True)
 
-    df_sorted = df_work.sort_values(by=sort_column, ascending=ascending).reset_index(drop=True)
+    # Columns starting with "group" are not relevant for seating; hide them.
+    hidden_cols = {c for c in all_cols if c.lower().startswith("group")}
 
-    # --- Editable student table with Include? checkbox ---
     st.markdown('<p class="section-label">Select students to include</p>', unsafe_allow_html=True)
-    hidden_cols = {c for c in data_cols if c.lower().startswith("group")}
-    hidden_col_config = {c: None for c in hidden_cols}
     edited_df = st.data_editor(
-        df_sorted[['Include?'] + data_cols],
+        df_sorted[["Include?"] + all_cols],
         column_config={
             "Include?": st.column_config.CheckboxColumn("Include?", default=True, width="small"),
-            **hidden_col_config,
+            **{c: None for c in hidden_cols},   # hide group columns
         },
-        disabled=data_cols,
+        disabled=all_cols,          # only the Include? checkbox is editable
         use_container_width=True,
         height=300,
         key=f"editor_{uploaded_file.name}",
     )
 
-    included_count = int(edited_df['Include?'].sum())
-    excluded_count = len(edited_df) - included_count
-    ic1, ic2 = st.columns(2)
-    ic1.caption(f"✅ {included_count} students included")
-    if excluded_count:
-        ic2.caption(f"⛔ {excluded_count} students excluded")
+    n_included = int(edited_df["Include?"].sum())
+    n_excluded = len(edited_df) - n_included
+    ca, cb = st.columns(2)
+    ca.caption(f"✅ {n_included} students included")
+    if n_excluded:
+        cb.caption(f"⛔ {n_excluded} students excluded")
 
+# Flat list of included student IDs (strings) used by assignment and validation
 included_students = (
-    edited_df[edited_df['Include?'] == True][id_column]
+    edited_df[edited_df["Include?"] == True][id_col]
     .dropna()
-    .apply(lambda x: str(int(x)) if isinstance(x, float) and not pd.isna(x) else ("" if pd.isna(x) else str(x)))
+    .apply(to_id_str)
     .tolist()
 )
 
-# Build a lookup df aligned with edited_df
+# Lookup dataframe: one row per student, indexed by "_id_str" for fast PDF row population
 df_lookup = edited_df.copy()
-df_lookup["_id_str"] = (
-    df_lookup[id_column]
-    .apply(lambda x: str(int(x)) if isinstance(x, float) and not pd.isna(x) else ("" if pd.isna(x) else str(x)))
-)
+df_lookup["_id_str"] = df_lookup[id_col].apply(to_id_str)
 
-# ── Step 3: PDF Column Selection ──────────────────────────────────────────────
+# ── Step 3: PDF Columns ───────────────────────────────────────────────────────
 with st.expander("Step 3 – PDF Column Selection", expanded=True):
-    pc1, pc2 = st.columns(2)
-    with pc1:
+    c1, c2 = st.columns(2)
+    with c1:
         st.markdown('<p class="section-label">Seating Plan columns</p>', unsafe_allow_html=True)
-        seating_cols = st.multiselect(
-            "Columns to include in Seating Plan",
-            data_cols,
-            default=[id_column],
-            key="seating_cols",
-        )
-    with pc2:
+        seating_cols = st.multiselect("Columns in Seating Plan",    all_cols, default=[id_col], key="seating_cols")
+    with c2:
         st.markdown('<p class="section-label">Signature Sheet columns</p>', unsafe_allow_html=True)
-        sig_cols = st.multiselect(
-            "Columns to include in Signature Sheet",
-            data_cols,
-            default=[id_column],
-            key="sig_cols",
-        )
+        sig_cols     = st.multiselect("Columns in Signature Sheet", all_cols, default=[id_col], key="sig_cols")
 
-# ── Step 4: Classroom Configuration ──────────────────────────────────────────
+# ── Step 4: Classrooms ────────────────────────────────────────────────────────
 with st.expander("Step 4 – Classroom Configuration", expanded=True):
-    class_count = st.number_input("Number of classrooms", min_value=1, max_value=20, value=2, step=1)
+    n_classes = int(st.number_input("Number of classrooms", min_value=1, max_value=20, value=2, step=1))
     classes = {}
-    grid_cols = st.columns(min(int(class_count), 4))
-    for i in range(int(class_count)):
-        with grid_cols[i % len(grid_cols)]:
-            cls_name = st.text_input(f"Class {i+1} name", key=f"class_name_{i}")
-            capacity = st.number_input("Capacity", min_value=1, max_value=500, value=30, key=f"capacity_{i}")
+    grid = st.columns(min(n_classes, 4))
+    for i in range(n_classes):
+        with grid[i % len(grid)]:
+            cls_name = st.text_input(f"Class {i + 1} name", key=f"cls_name_{i}")
+            cls_cap  = st.number_input("Capacity", min_value=1, max_value=500, value=30, key=f"cls_cap_{i}")
             if cls_name:
-                classes[cls_name] = capacity
+                classes[cls_name] = cls_cap
 
 # ── Step 5: Seating Mode ──────────────────────────────────────────────────────
+_MODE_LABELS = {
+    "A": "A – Completely Random",
+    "B": "B – Alphabetical Split → Random within rooms",
+    "F": "F – Stratified by Group (every room gets a fair share of each group)",
+}
+
 with st.expander("Step 5 – Seating Mode", expanded=True):
-    seating_mode = st.radio(
-        "Seating mode",
-        ["Completely Random", "Alphabetically Split, then Random"],
+    mode_key = st.radio(
+        "How should students be assigned to classrooms?",
+        list(_MODE_LABELS.keys()),
+        format_func=lambda k: _MODE_LABELS[k],
         horizontal=True,
     )
-    if seating_mode == "Alphabetically Split, then Random":
-        name_column = st.selectbox("Sort students alphabetically by", data_cols)
+
+    # ── Mode A options ────────────────────────────────────────────────────────
+    random_seed: int | None = None
+    if mode_key == "A":
+        use_seed = st.checkbox("Use fixed seed for reproducible results", value=False)
+        if use_seed:
+            random_seed = int(st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1))
+
+    # ── Mode B options ────────────────────────────────────────────────────────
+    alpha_sort_col: str | None = None
+    alpha_ascending: bool = True
+    if mode_key == "B":
+        bc1, bc2 = st.columns(2)
+        alpha_sort_col = bc1.selectbox("Sort students by", all_cols, index=first_match_index(all_cols, ["Last name", "Name - Surname", "First name"]))
+        alpha_ascending = bc2.checkbox("Ascending (A → Z)", value=True)
+
+    # ── Mode F options ────────────────────────────────────────────────────────
+    group_col: str | None = None
+    if mode_key == "F":
+        group_col = st.selectbox(
+            "Column that contains group / section info",
+            all_cols,
+            index=first_match_index(all_cols, ["Groups", "Group", "Section", "group"]),
+        )
+        if group_col:
+            unique_groups = (
+                df_lookup[df_lookup["Include?"] == True][group_col]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+            unique_groups = sorted(g for g in unique_groups if g not in ("", "nan", "None"))
+            if unique_groups:
+                st.caption(f"Found groups: {', '.join(unique_groups)}. Each room will receive a proportional share of every group.")
+            else:
+                st.warning("No non-empty group values found in the selected column.")
 
 # ── Generate ──────────────────────────────────────────────────────────────────
 st.divider()
-generate = st.button("Generate Seating", type="primary", use_container_width=True)
+if st.button("Generate Seating", type="primary", use_container_width=True):
 
-if generate:
-    errors = []
-    if not classes:
-        errors.append("Enter at least one classroom name.")
-    if not seating_cols:
-        errors.append("Select at least one column for the Seating Plan.")
-    if not sig_cols:
-        errors.append("Select at least one column for the Signature Sheet.")
-    if not included_students:
-        errors.append("No students are included.")
-    for err in errors:
-        st.error(err)
+    errors = get_hard_errors(classes, included_students, seating_cols, sig_cols)
+    for msg in errors:
+        st.error(msg)
     if errors:
         st.stop()
 
     try:
-        total_capacity = sum(classes.values())
-        assignments = {}
-        index = 0
-
-        if seating_mode == "Completely Random":
-            students = included_students[:]
-            random.shuffle(students)
-            total_students = len(students)
-            for i, (cls, cap) in enumerate(classes.items()):
-                if i == len(classes) - 1:
-                    assignments[cls] = students[index:]
-                else:
-                    num = round(total_students * cap / total_capacity)
-                    assignments[cls] = students[index:index + num]
-                    index += num
-        else:
-            included_df = edited_df[edited_df['Include?'] == True].copy()
-            included_df = included_df.sort_values(by=name_column)
-            students_sorted = (
-                included_df[id_column]
-                .dropna()
-                .apply(lambda x: str(int(x)) if isinstance(x, float) and not pd.isna(x) else ("" if pd.isna(x) else str(x)))
-                .tolist()
+        if mode_key == "A":
+            assignments = assign_randomly(included_students, classes, seed=random_seed)
+        elif mode_key == "B":
+            assignments = assign_alphabetically(
+                included_students, classes, df_lookup, alpha_sort_col, ascending=alpha_ascending
             )
-            total_students = len(students_sorted)
-            for i, (cls, cap) in enumerate(classes.items()):
-                if i == len(classes) - 1:
-                    group = students_sorted[index:]
-                else:
-                    num = round(total_students * cap / total_capacity)
-                    group = students_sorted[index:index + num]
-                    index += num
-                random.shuffle(group)
-                assignments[cls] = group
+        else:  # F
+            assignments = assign_stratified(
+                included_students, classes, df_lookup, group_col
+            )
 
-        def get_values(student_id, columns):
-            row = df_lookup[df_lookup["_id_str"] == student_id]
-            if row.empty:
-                return [""] * len(columns)
-            return [str(row.iloc[0][c]) for c in columns]
+        for msg in get_soft_warnings(assignments, classes):
+            st.warning(msg)
 
-        PAGE_W = A4[0] - 80  # ~515 pt usable width
-        HDR_COLOR = colors.HexColor('#1a365d')
-        ROW_ALT   = colors.HexColor('#ebf4ff')
-        DIVIDER   = colors.HexColor('#2b6cb0')
-
-        def base_style(n_left_cols, n_total_cols, n_rows):
-            cmds = [
-                ('BACKGROUND', (0, 0), (-1, 0), HDR_COLOR),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#d0dde8')),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                # Bold divider between the two halves
-                ('LINEAFTER', (n_left_cols - 1, 0), (n_left_cols - 1, -1), 2.5, DIVIDER),
-            ]
-            for row_i in range(1, n_rows):
-                if row_i % 2 == 0:
-                    cmds.append(('BACKGROUND', (0, row_i), (-1, row_i), ROW_ALT))
-            return cmds
-
-        # ── Seating PDF ───────────────────────────────────────────────────────
-        n_sc = len(seating_cols)
-        seat_w = 32
-        data_w = (PAGE_W / 2 - seat_w) / n_sc
-        seating_cw = ([seat_w] + [data_w] * n_sc) * 2
-
-        seating_buffer = BytesIO()
-        doc = SimpleDocTemplate(seating_buffer, pagesize=A4,
-                                leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40)
-        elements = []
-        styles = getSampleStyleSheet()
-
-        for idx_cls, (cls, student_list) in enumerate(assignments.items()):
-            if idx_cls > 0:
-                elements.append(PageBreak())
-            elements.append(Paragraph(f"<b>{cls}</b>", styles['Title']))
-            elements.append(Spacer(1, 10))
-
-            half = math.ceil(len(student_list) / 2)
-            col1, col2 = student_list[:half], student_list[half:]
-            header = ["Seat"] + list(seating_cols) + ["Seat"] + list(seating_cols)
-            table_data = [header]
-            for j in range(half):
-                left = [str(j + 1)] + get_values(col1[j], seating_cols)
-                right = (
-                    [str(j + 1 + half)] + get_values(col2[j], seating_cols)
-                    if j < len(col2) else [""] * (1 + n_sc)
-                )
-                table_data.append(left + right)
-
-            cmds = base_style(1 + n_sc, len(header), len(table_data))
-            cmds.append(('ROWHEIGHT', (0, 0), (-1, -1), 16))
-            t = Table(table_data, colWidths=seating_cw)
-            t.setStyle(TableStyle(cmds))
-            elements.append(t)
-
-        doc.build(elements)
-        seating_buffer.seek(0)
-        st.session_state.pdf_buffer = seating_buffer
-
-        # ── Signature PDF ─────────────────────────────────────────────────────
-        n_sg = len(sig_cols)
-        sig_w = 62
-        data_w2 = max((PAGE_W / 2 - seat_w - sig_w) / n_sg, 38)
-        sig_cw = ([seat_w] + [data_w2] * n_sg + [sig_w]) * 2
-
-        sig_buffer = BytesIO()
-        doc = SimpleDocTemplate(sig_buffer, pagesize=A4,
-                                leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40)
-        elements = []
-
-        for idx_cls, (cls, student_list) in enumerate(assignments.items()):
-            if idx_cls > 0:
-                elements.append(PageBreak())
-            elements.append(Paragraph(f"<b>{cls} – Signature Sheet</b>", styles['Title']))
-            elements.append(Spacer(1, 10))
-
-            half = math.ceil(len(student_list) / 2)
-            col1, col2 = student_list[:half], student_list[half:]
-            header = ["Seat"] + list(sig_cols) + ["Signature"] + ["Seat"] + list(sig_cols) + ["Signature"]
-            table_data = [header]
-            for j in range(half):
-                left = [str(j + 1)] + get_values(col1[j], sig_cols) + [""]
-                right = (
-                    [str(j + 1 + half)] + get_values(col2[j], sig_cols) + [""]
-                    if j < len(col2) else [""] * (2 + n_sg)
-                )
-                table_data.append(left + right)
-
-            cmds = base_style(1 + n_sg + 1, len(header), len(table_data))
-            cmds.append(('ROWHEIGHT', (0, 0), (-1, -1), 22))
-            t = Table(table_data, colWidths=sig_cw)
-            t.setStyle(TableStyle(cmds))
-            elements.append(t)
-
-        doc.build(elements)
-        sig_buffer.seek(0)
-        st.session_state.signature_buffer = sig_buffer
+        st.session_state.pdf_buffer       = build_seating_pdf(assignments, seating_cols, df_lookup)
+        st.session_state.signature_buffer = build_signature_pdf(assignments, sig_cols, df_lookup)
 
         st.success("Seating plan and signature sheet generated successfully!")
-        metric_cols = st.columns(len(assignments))
-        for (cls, lst), col in zip(assignments.items(), metric_cols):
-            col.metric(cls, f"{len(lst)} students")
+        metrics = st.columns(len(assignments))
+        for (cls, students), col in zip(assignments.items(), metrics):
+            col.metric(cls, f"{len(students)} students")
 
     except Exception as e:
         st.error(f"Failed to generate PDFs: {e}")
@@ -407,14 +641,9 @@ if generate:
 # ── Download ──────────────────────────────────────────────────────────────────
 if st.session_state.pdf_buffer and st.session_state.signature_buffer:
     st.divider()
-    zip_buffer = BytesIO()
-    with ZipFile(zip_buffer, 'w') as zf:
-        zf.writestr("exam_seating.pdf", st.session_state.pdf_buffer.getvalue())
-        zf.writestr("signature_sheet.pdf", st.session_state.signature_buffer.getvalue())
-    zip_buffer.seek(0)
     st.download_button(
-        label="⬇ Download Seating Plan & Signature Sheet (ZIP)",
-        data=zip_buffer,
+        label="⬇  Download Seating Plan & Signature Sheet (ZIP)",
+        data=build_zip(st.session_state.pdf_buffer, st.session_state.signature_buffer),
         file_name="exam_documents.zip",
         mime="application/zip",
         use_container_width=True,
