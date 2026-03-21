@@ -15,6 +15,8 @@ Workflow:
 import math
 import os
 import random
+import tempfile
+import urllib.request
 from io import BytesIO
 from zipfile import ZipFile
 
@@ -34,14 +36,15 @@ from reportlab.platypus import (
 # Fonts
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Helvetica (ReportLab's built-in) does not support Turkish characters.
-# We register the first available Unicode TTF font as a drop-in replacement.
-_UNICODE_FONT_CANDIDATES = {
+# Helvetica (ReportLab built-in) does not support Turkish characters (İ, Ş, Ğ, …).
+# We try system fonts first, then download DejaVu Sans as a guaranteed fallback.
+
+_SYSTEM_FONT_CANDIDATES = {
     "regular": [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",       # Linux / Streamlit Cloud
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",        # Linux / Streamlit Cloud
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/Library/Fonts/Arial.ttf",                               # macOS
+        "/Library/Fonts/Arial.ttf",                                # macOS (if Office installed)
         "/System/Library/Fonts/Supplemental/Arial.ttf",
     ],
     "bold": [
@@ -53,24 +56,62 @@ _UNICODE_FONT_CANDIDATES = {
     ],
 }
 
+_DEJAVU_BASE = (
+    "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf/"
+)
+
+
+def _ensure_dejavu_fonts() -> tuple[str | None, str | None]:
+    """Download DejaVu Sans to a temp dir if not already cached. Returns (reg_path, bold_path)."""
+    tmp = tempfile.gettempdir()
+    files = {"regular": "DejaVuSans.ttf", "bold": "DejaVuSans-Bold.ttf"}
+    paths = {}
+    for variant, filename in files.items():
+        dest = os.path.join(tmp, filename)
+        if not os.path.exists(dest):
+            try:
+                urllib.request.urlretrieve(_DEJAVU_BASE + filename, dest)
+            except Exception:
+                dest = None
+        paths[variant] = dest if dest and os.path.exists(str(dest)) else None
+    return paths["regular"], paths["bold"]
+
 
 def _register_unicode_fonts() -> tuple[str, str]:
-    """Try to register a Unicode TTF font for PDF output.
+    """Register a Unicode TTF font that covers Turkish characters.
 
-    Returns (regular_name, bold_name) for use in ReportLab styles.
-    Falls back to the built-in Helvetica if no suitable font is found.
+    Search order:
+    1. Known system font paths (fast, no network).
+    2. Download DejaVu Sans from GitHub (once, cached in /tmp).
+    3. Fall back to Helvetica with a warning (Turkish chars will render as boxes).
     """
     reg, bold = "Helvetica", "Helvetica-Bold"
-    for path in _UNICODE_FONT_CANDIDATES["regular"]:
-        if os.path.exists(path):
-            pdfmetrics.registerFont(TTFont("UniFont", path))
+
+    def _try_register(path: str, name: str) -> bool:
+        try:
+            pdfmetrics.registerFont(TTFont(name, path))
+            return True
+        except Exception:
+            return False
+
+    for path in _SYSTEM_FONT_CANDIDATES["regular"]:
+        if os.path.exists(path) and _try_register(path, "UniFont"):
             reg = "UniFont"
             break
-    for path in _UNICODE_FONT_CANDIDATES["bold"]:
-        if os.path.exists(path):
-            pdfmetrics.registerFont(TTFont("UniFont-Bold", path))
+
+    for path in _SYSTEM_FONT_CANDIDATES["bold"]:
+        if os.path.exists(path) and _try_register(path, "UniFont-Bold"):
             bold = "UniFont-Bold"
             break
+
+    # If either variant is still missing, try downloading DejaVu
+    if reg == "Helvetica" or bold == "Helvetica-Bold":
+        dv_reg, dv_bold = _ensure_dejavu_fonts()
+        if reg == "Helvetica" and dv_reg and _try_register(dv_reg, "UniFont"):
+            reg = "UniFont"
+        if bold == "Helvetica-Bold" and dv_bold and _try_register(dv_bold, "UniFont-Bold"):
+            bold = "UniFont-Bold"
+
     return reg, bold
 
 
@@ -231,44 +272,6 @@ def assign_alphabetically(
     return assignments
 
 
-def assign_stratified(
-    students: list,
-    classes: dict,
-    df_lookup: pd.DataFrame,
-    group_col: str,
-) -> dict[str, list]:
-    """(Mode F) Stratified assignment — every room gets a proportional share of each group.
-
-    Students are first separated by their group value.  Within each group they
-    are shuffled, then distributed proportionally across rooms (same algorithm
-    as Mode A but applied per-group).  This guarantees that no single group is
-    concentrated in one room.
-
-    Students with a missing / blank group value are treated as their own group.
-    """
-    id_to_group = dict(zip(df_lookup["_id_str"], df_lookup[group_col].astype(str)))
-
-    # Bucket students by group, shuffle within each bucket
-    buckets: dict[str, list] = {}
-    for sid in students:
-        grp = id_to_group.get(sid, "")
-        buckets.setdefault(grp, []).append(sid)
-    for grp in buckets:
-        random.shuffle(buckets[grp])
-
-    # Distribute each group proportionally across rooms, then merge
-    assignments: dict[str, list] = {cls: [] for cls in classes}
-    for grp_students in buckets.values():
-        grp_assignments = _split_proportionally(grp_students, classes)
-        for cls, grp_slice in grp_assignments.items():
-            assignments[cls].extend(grp_slice)
-
-    # Shuffle final seat order within each room so groups are not visually clustered
-    for cls in assignments:
-        random.shuffle(assignments[cls])
-
-    return assignments
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PDF generation
@@ -313,12 +316,25 @@ def _compute_col_widths(n_data_cols: int, include_signature: bool) -> list[float
     return one_half * 2   # repeated for left and right halves
 
 
+def _cell_to_str(value) -> str:
+    """Convert a cell value to a display string.
+
+    Whole-number floats (e.g. 2022401234.0) are rendered without the decimal
+    point.  Actual decimals (e.g. 85.5) are kept as-is.
+    """
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value == int(value):
+        return str(int(value))
+    return str(value)
+
+
 def _lookup_student_values(df_lookup: pd.DataFrame, student_id: str, columns: list) -> list:
     """Return column values for one student from the lookup dataframe."""
     row = df_lookup[df_lookup["_id_str"] == student_id]
     if row.empty:
         return [""] * len(columns)
-    return [str(row.iloc[0][col]) for col in columns]
+    return [_cell_to_str(row.iloc[0][col]) for col in columns]
 
 
 def _build_table_data(
@@ -407,54 +423,117 @@ def build_zip(seating_buf: BytesIO, signature_buf: BytesIO) -> BytesIO:
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Exam Seating Generator", layout="wide")
+st.set_page_config(page_title="Exam Seating Generator", layout="wide", page_icon="🪑")
 
 st.markdown("""
 <style>
-h1 { color: #63b3ed; font-size: 2rem !important; margin-bottom: 0.25rem !important; }
+/* ── Page background ─────────────────────────────────────────────────────── */
+[data-testid="stAppViewContainer"] {
+    background: linear-gradient(160deg, #0f1117 0%, #1a1f2e 60%, #0f1117 100%);
+}
+[data-testid="stHeader"] { background: transparent; }
 
+/* ── Title ───────────────────────────────────────────────────────────────── */
+h1 {
+    background: linear-gradient(90deg, #63b3ed, #90cdf4, #4299e1);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    font-size: 2.2rem !important; font-weight: 800 !important;
+    letter-spacing: -0.5px; margin-bottom: 0.1rem !important;
+}
+.subtitle {
+    color: #718096; font-size: 0.95rem; margin-bottom: 1.5rem;
+}
+
+/* ── Step expanders ──────────────────────────────────────────────────────── */
 [data-testid="stExpander"] > details {
-    border: 1px solid rgba(99,179,237,0.25); border-radius: 10px;
-    margin-bottom: 0.75rem; background: rgba(26,32,44,0.3);
+    border: 1px solid rgba(99,179,237,0.18);
+    border-radius: 12px;
+    margin-bottom: 0.8rem;
+    background: rgba(26,32,44,0.55);
+    backdrop-filter: blur(6px);
+    box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+    transition: border-color 0.2s;
+}
+[data-testid="stExpander"] > details:hover {
+    border-color: rgba(99,179,237,0.35);
 }
 [data-testid="stExpander"] > details > summary {
-    font-size: 1rem; font-weight: 600; color: #90cdf4; padding: 0.6rem 1rem;
+    font-size: 1rem; font-weight: 700;
+    color: #90cdf4; padding: 0.75rem 1.2rem;
+    letter-spacing: 0.01em;
 }
 [data-testid="stExpander"] > details > summary:hover { color: #bee3f8; }
+[data-testid="stExpander"] > details > summary::marker { color: #4299e1; }
 
+/* ── Section labels inside expanders ─────────────────────────────────────── */
 .section-label {
-    font-size: 0.78rem; font-weight: 600; letter-spacing: 0.08em;
-    text-transform: uppercase; color: #63b3ed; margin-bottom: 0.25rem;
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.1em;
+    text-transform: uppercase; color: #4299e1; margin-bottom: 0.3rem;
+    padding-left: 2px;
 }
+
+/* ── Generate button ─────────────────────────────────────────────────────── */
 .stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, #2b6cb0, #3182ce); color: white;
-    border: none; border-radius: 8px; font-size: 1.1rem; font-weight: 700;
-    padding: 0.7rem 1rem; transition: all 0.2s ease;
+    background: linear-gradient(135deg, #2b6cb0 0%, #3182ce 50%, #4299e1 100%);
+    color: white; border: none; border-radius: 10px;
+    font-size: 1.1rem; font-weight: 700;
+    padding: 0.75rem 1rem; transition: all 0.25s ease;
+    box-shadow: 0 2px 10px rgba(49,130,206,0.3);
 }
 .stButton > button[kind="primary"]:hover {
-    background: linear-gradient(135deg, #3182ce, #4299e1);
-    box-shadow: 0 4px 18px rgba(49,130,206,0.45); transform: translateY(-1px);
+    background: linear-gradient(135deg, #3182ce 0%, #4299e1 100%);
+    box-shadow: 0 6px 24px rgba(49,130,206,0.55);
+    transform: translateY(-2px);
 }
+.stButton > button[kind="primary"]:active { transform: translateY(0); }
+
+/* ── Download button ─────────────────────────────────────────────────────── */
 .stDownloadButton > button {
-    background: linear-gradient(135deg, #276749, #38a169) !important;
-    color: white !important; border: none !important; border-radius: 8px !important;
-    font-size: 1.05rem !important; font-weight: 600 !important; transition: all 0.2s ease !important;
+    background: linear-gradient(135deg, #1c4532, #276749, #38a169) !important;
+    color: white !important; border: none !important; border-radius: 10px !important;
+    font-size: 1.05rem !important; font-weight: 700 !important;
+    transition: all 0.25s ease !important;
+    box-shadow: 0 2px 10px rgba(56,161,105,0.25) !important;
 }
 .stDownloadButton > button:hover {
-    background: linear-gradient(135deg, #38a169, #48bb78) !important;
-    box-shadow: 0 4px 18px rgba(56,161,105,0.4) !important; transform: translateY(-1px) !important;
+    background: linear-gradient(135deg, #276749, #48bb78) !important;
+    box-shadow: 0 6px 24px rgba(56,161,105,0.45) !important;
+    transform: translateY(-2px) !important;
 }
+
+/* ── Metric cards ────────────────────────────────────────────────────────── */
 [data-testid="stMetric"] {
-    background: rgba(49,130,206,0.12); border: 1px solid rgba(99,179,237,0.3);
-    border-radius: 8px; padding: 0.6rem 1rem;
+    background: linear-gradient(135deg, rgba(49,130,206,0.1), rgba(66,153,225,0.06));
+    border: 1px solid rgba(99,179,237,0.25);
+    border-radius: 10px; padding: 0.75rem 1.2rem;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.2);
 }
-[data-testid="stMetricValue"] { color: #90cdf4 !important; font-weight: 700; }
-[data-testid="stAlert"] { border-radius: 8px; }
-hr { border-color: rgba(99,179,237,0.2) !important; }
+[data-testid="stMetricLabel"] { color: #718096 !important; font-size: 0.8rem !important; }
+[data-testid="stMetricValue"] { color: #90cdf4 !important; font-weight: 800 !important; font-size: 1.6rem !important; }
+
+/* ── Alerts ──────────────────────────────────────────────────────────────── */
+[data-testid="stAlert"] { border-radius: 10px; }
+
+/* ── Divider ─────────────────────────────────────────────────────────────── */
+hr { border-color: rgba(99,179,237,0.15) !important; }
+
+/* ── Number inputs / text inputs ─────────────────────────────────────────── */
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input {
+    border-radius: 8px !important;
+}
+
+/* ── Multiselect tags ────────────────────────────────────────────────────── */
+[data-testid="stMultiSelect"] span[data-baseweb="tag"] {
+    background-color: rgba(49,130,206,0.25) !important;
+    border: 1px solid rgba(99,179,237,0.4) !important;
+    border-radius: 6px !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("Exam Seating Generator")
+st.markdown('<p class="subtitle">Generate randomised seating plans and signature sheets for exams.</p>', unsafe_allow_html=True)
 
 for key in ["pdf_buffer", "signature_buffer"]:
     if key not in st.session_state:
@@ -551,56 +630,33 @@ with st.expander("Step 4 – Classroom Configuration", expanded=True):
                 classes[cls_name] = cls_cap
 
 # ── Step 5: Seating Mode ──────────────────────────────────────────────────────
-_MODE_LABELS = {
-    "A": "A – Completely Random",
-    "B": "B – Alphabetical Split → Random within rooms",
-    "F": "F – Stratified by Group (every room gets a fair share of each group)",
+_SEATING_MODES = {
+    "random":       "Completely Random",
+    "alphabetical": "Alphabetical Split → Random within rooms",
 }
 
 with st.expander("Step 5 – Seating Mode", expanded=True):
     mode_key = st.radio(
         "How should students be assigned to classrooms?",
-        list(_MODE_LABELS.keys()),
-        format_func=lambda k: _MODE_LABELS[k],
+        list(_SEATING_MODES.keys()),
+        format_func=lambda k: _SEATING_MODES[k],
         horizontal=True,
     )
 
-    # ── Mode A options ────────────────────────────────────────────────────────
+    # ── Random options ────────────────────────────────────────────────────────
     random_seed: int | None = None
-    if mode_key == "A":
+    if mode_key == "random":
         use_seed = st.checkbox("Use fixed seed for reproducible results", value=False)
         if use_seed:
             random_seed = int(st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1))
 
-    # ── Mode B options ────────────────────────────────────────────────────────
+    # ── Alphabetical options ──────────────────────────────────────────────────
     alpha_sort_col: str | None = None
     alpha_ascending: bool = True
-    if mode_key == "B":
+    if mode_key == "alphabetical":
         bc1, bc2 = st.columns(2)
         alpha_sort_col = bc1.selectbox("Sort students by", all_cols, index=first_match_index(all_cols, ["Last name", "Name - Surname", "First name"]))
         alpha_ascending = bc2.checkbox("Ascending (A → Z)", value=True)
-
-    # ── Mode F options ────────────────────────────────────────────────────────
-    group_col: str | None = None
-    if mode_key == "F":
-        group_col = st.selectbox(
-            "Column that contains group / section info",
-            all_cols,
-            index=first_match_index(all_cols, ["Groups", "Group", "Section", "group"]),
-        )
-        if group_col:
-            unique_groups = (
-                df_lookup[df_lookup["Include?"] == True][group_col]
-                .dropna()
-                .astype(str)
-                .unique()
-                .tolist()
-            )
-            unique_groups = sorted(g for g in unique_groups if g not in ("", "nan", "None"))
-            if unique_groups:
-                st.caption(f"Found groups: {', '.join(unique_groups)}. Each room will receive a proportional share of every group.")
-            else:
-                st.warning("No non-empty group values found in the selected column.")
 
 # ── Generate ──────────────────────────────────────────────────────────────────
 st.divider()
@@ -613,15 +669,11 @@ if st.button("Generate Seating", type="primary", use_container_width=True):
         st.stop()
 
     try:
-        if mode_key == "A":
+        if mode_key == "random":
             assignments = assign_randomly(included_students, classes, seed=random_seed)
-        elif mode_key == "B":
+        else:  # alphabetical
             assignments = assign_alphabetically(
                 included_students, classes, df_lookup, alpha_sort_col, ascending=alpha_ascending
-            )
-        else:  # F
-            assignments = assign_stratified(
-                included_students, classes, df_lookup, group_col
             )
 
         for msg in get_soft_warnings(assignments, classes):
