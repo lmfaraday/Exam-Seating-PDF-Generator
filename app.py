@@ -172,7 +172,7 @@ with st.expander("Step 2 – Student Preview & Settings", expanded=True):
 included_students = (
     edited_df[edited_df['Include?'] == True][id_column]
     .dropna()
-    .apply(lambda x: str(int(x)) if isinstance(x, float) else str(x))
+    .apply(lambda x: str(int(x)) if isinstance(x, float) and not pd.isna(x) else ("" if pd.isna(x) else str(x)))
     .tolist()
 )
 
@@ -180,7 +180,7 @@ included_students = (
 df_lookup = edited_df.copy()
 df_lookup["_id_str"] = (
     df_lookup[id_column]
-    .apply(lambda x: str(int(x)) if isinstance(x, float) else str(x))
+    .apply(lambda x: str(int(x)) if isinstance(x, float) and not pd.isna(x) else ("" if pd.isna(x) else str(x)))
 )
 
 # ── Step 3: PDF Column Selection ──────────────────────────────────────────────
@@ -266,7 +266,7 @@ if generate:
             students_sorted = (
                 included_df[id_column]
                 .dropna()
-                .apply(lambda x: str(int(x)) if isinstance(x, float) else str(x))
+                .apply(lambda x: str(int(x)) if isinstance(x, float) and not pd.isna(x) else ("" if pd.isna(x) else str(x)))
                 .tolist()
             )
             total_students = len(students_sorted)
