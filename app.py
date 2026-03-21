@@ -251,8 +251,8 @@ def assign_alphabetically(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _PAGE_W  = A4[0] - 80   # usable width in points (~515 pt with 40 pt side margins)
-_SEAT_W  = 32            # fixed width of the "Seat" number column
-_SIG_W   = 62            # fixed width of the "Signature" column
+_SIG_W   = 65            # fixed width of the "Signature" column
+_CELL_PAD = 10           # horizontal padding added to every measured cell width
 
 
 def _make_table_style(n_left_cols: int, row_height: int) -> TableStyle:
@@ -278,15 +278,60 @@ def _make_title_style() -> ParagraphStyle:
     return ParagraphStyle("ExamTitle", parent=getSampleStyleSheet()["Title"], fontName=FONT_BOLD)
 
 
-def _compute_col_widths(n_data_cols: int, include_signature: bool) -> list[float]:
-    """Calculate column widths so both halves fill the page evenly.
+def _compute_col_widths(
+    table_data: list[list],
+    n_data_cols: int,
+    include_signature: bool,
+) -> list[float]:
+    """Calculate column widths based on actual cell content.
 
-    Layout per half:  [Seat | data cols... | (Signature)]
+    For each column position in one half, we measure the widest text that
+    appears in any row (header or data) using ReportLab's stringWidth.
+    The Seat column is capped narrow; the Signature column gets a fixed width.
+    All remaining space is distributed to the data columns proportionally to
+    their measured natural widths.
     """
-    sig_space = _SIG_W if include_signature else 0
-    data_w = max((_PAGE_W / 2 - _SEAT_W - sig_space) / n_data_cols, 38)
-    one_half = [_SEAT_W] + [data_w] * n_data_cols + ([_SIG_W] if include_signature else [])
-    return one_half * 2   # repeated for left and right halves
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    half_ncols = 1 + n_data_cols + (1 if include_signature else 0)
+
+    # Measure the natural (content-driven) width of each column
+    natural = [0.0] * half_ncols
+    for row_idx, row in enumerate(table_data):
+        font = FONT_BOLD if row_idx == 0 else FONT_REG
+        fsize = 9 if row_idx == 0 else 8
+        for side in (0, 1):
+            for c in range(half_ncols):
+                src = side * half_ncols + c
+                if src < len(row):
+                    w = stringWidth(str(row[src]), font, fsize) + _CELL_PAD
+                    natural[c] = max(natural[c], w)
+
+    # Seat column: just needs to fit "Seat" + up to 3-digit numbers
+    natural[0] = max(natural[0], 26)
+
+    # Signature column: fixed — only needs to be wide enough to write a name
+    if include_signature:
+        natural[-1] = _SIG_W
+
+    # Distribute the available half-width:
+    #   fixed portion  = Seat + Signature (if present)
+    #   flexible portion = data cols, scaled proportionally from measured widths
+    available_half = _PAGE_W / 2
+    n_data_end = -1 if include_signature else len(natural)
+    data_natural = natural[1:n_data_end]
+
+    fixed_w = natural[0] + (natural[-1] if include_signature else 0)
+    data_available = available_half - fixed_w
+    data_total_natural = sum(data_natural)
+
+    if data_total_natural > 0:
+        data_widths = [w * data_available / data_total_natural for w in data_natural]
+    else:
+        data_widths = [data_available / max(n_data_cols, 1)] * n_data_cols
+
+    one_half = [natural[0]] + data_widths + ([_SIG_W] if include_signature else [])
+    return one_half * 2
 
 
 def _cell_to_str(value) -> str:
@@ -349,7 +394,6 @@ def _build_pdf(
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40)
     title_style = _make_title_style()
 
-    col_widths  = _compute_col_widths(len(columns), include_signature)
     n_left_cols = 1 + len(columns) + (1 if include_signature else 0)
     row_height  = 22 if include_signature else 16
 
@@ -363,6 +407,8 @@ def _build_pdf(
         elements.append(Spacer(1, 10))
 
         table_data = _build_table_data(students, columns, df_lookup, include_signature)
+        # Compute widths from actual content so every column fits its data
+        col_widths = _compute_col_widths(table_data, len(columns), include_signature)
         table = Table(table_data, colWidths=col_widths)
         table.setStyle(_make_table_style(n_left_cols, row_height))
         elements.append(table)
