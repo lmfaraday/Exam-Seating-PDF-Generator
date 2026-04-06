@@ -252,6 +252,7 @@ def assign_alphabetically(
 
 _PAGE_W  = A4[0] - 80   # usable width in points (~515 pt with 40 pt side margins)
 _SIG_W   = 65            # fixed width of the "Signature" column
+_NAME_W  = 90            # fixed width of the blank "Name" column on signature sheets
 _CELL_PAD = 10           # horizontal padding added to every measured cell width
 
 
@@ -293,7 +294,7 @@ def _compute_col_widths(
     """
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
-    half_ncols = 1 + n_data_cols + (1 if include_signature else 0)
+    half_ncols = 1 + n_data_cols + (2 if include_signature else 0)
 
     # Measure the natural (content-driven) width of each column
     natural = [0.0] * half_ncols
@@ -310,18 +311,19 @@ def _compute_col_widths(
     # Seat column: just needs to fit "Seat" + up to 3-digit numbers
     natural[0] = max(natural[0], 26)
 
-    # Signature column: fixed — only needs to be wide enough to write a name
+    # Name + Signature columns: fixed widths — students write into these by hand
     if include_signature:
+        natural[-2] = _NAME_W
         natural[-1] = _SIG_W
 
     # Distribute the available half-width:
-    #   fixed portion  = Seat + Signature (if present)
+    #   fixed portion  = Seat + Name + Signature (if present)
     #   flexible portion = data cols, scaled proportionally from measured widths
     available_half = _PAGE_W / 2
-    n_data_end = -1 if include_signature else len(natural)
+    n_data_end = -2 if include_signature else len(natural)
     data_natural = natural[1:n_data_end]
 
-    fixed_w = natural[0] + (natural[-1] if include_signature else 0)
+    fixed_w = natural[0] + (natural[-2] + natural[-1] if include_signature else 0)
     data_available = available_half - fixed_w
     data_total_natural = sum(data_natural)
 
@@ -330,7 +332,7 @@ def _compute_col_widths(
     else:
         data_widths = [data_available / max(n_data_cols, 1)] * n_data_cols
 
-    one_half = [natural[0]] + data_widths + ([_SIG_W] if include_signature else [])
+    one_half = [natural[0]] + data_widths + ([_NAME_W, _SIG_W] if include_signature else [])
     return one_half * 2
 
 
@@ -366,7 +368,7 @@ def _build_table_data(
     The page is split into left and right halves. Each half shows:
         Seat | data_cols... | [Signature]
     """
-    sig = ["Signature"] if include_signature else []
+    sig = ["Name", "Signature"] if include_signature else []
     half = math.ceil(len(students) / 2)
     left_half, right_half = students[:half], students[half:]
     n_data = len(data_cols)
@@ -388,13 +390,14 @@ def _build_pdf(
     columns: list,
     df_lookup: pd.DataFrame,
     include_signature: bool,
+    extra_blank_rows: int = 0,
 ) -> BytesIO:
     """Core PDF builder used by both the seating plan and signature sheet."""
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40)
     title_style = _make_title_style()
 
-    n_left_cols = 1 + len(columns) + (1 if include_signature else 0)
+    n_left_cols = 1 + len(columns) + (2 if include_signature else 0)
     row_height  = 22 if include_signature else 16
 
     elements = []
@@ -406,7 +409,11 @@ def _build_pdf(
         elements.append(Paragraph(heading, title_style))
         elements.append(Spacer(1, 10))
 
-        table_data = _build_table_data(students, columns, df_lookup, include_signature)
+        students_for_table = list(students)
+        if include_signature and extra_blank_rows > 0:
+            students_for_table += [f"__blank_{j}__" for j in range(extra_blank_rows)]
+
+        table_data = _build_table_data(students_for_table, columns, df_lookup, include_signature)
         # Compute widths from actual content so every column fits its data
         col_widths = _compute_col_widths(table_data, len(columns), include_signature)
         table = Table(table_data, colWidths=col_widths)
@@ -423,9 +430,9 @@ def build_seating_pdf(assignments: dict, columns: list, df_lookup: pd.DataFrame)
     return _build_pdf(assignments, columns, df_lookup, include_signature=False)
 
 
-def build_signature_pdf(assignments: dict, columns: list, df_lookup: pd.DataFrame) -> BytesIO:
-    """Generate the signature sheet PDF (same as seating plan + blank Signature column)."""
-    return _build_pdf(assignments, columns, df_lookup, include_signature=True)
+def build_signature_pdf(assignments: dict, columns: list, df_lookup: pd.DataFrame, extra_blank_rows: int = 0) -> BytesIO:
+    """Generate the signature sheet PDF (same as seating plan + blank Name and Signature columns)."""
+    return _build_pdf(assignments, columns, df_lookup, include_signature=True, extra_blank_rows=extra_blank_rows)
 
 
 def build_zip(seating_buf: BytesIO, signature_buf: BytesIO) -> BytesIO:
@@ -635,6 +642,10 @@ with st.expander("Step 3 – PDF Column Selection", expanded=True):
     with c2:
         st.markdown('<p class="section-label">Signature Sheet columns</p>', unsafe_allow_html=True)
         sig_cols     = st.multiselect("Columns in Signature Sheet", all_cols, default=[id_col], key="sig_cols")
+        sig_extra_rows = st.number_input(
+            "Extra blank rows at bottom (for walk-ins)",
+            min_value=0, max_value=50, value=0, step=1, key="sig_extra_rows"
+        )
 
 # ── Step 4: Classrooms ────────────────────────────────────────────────────────
 with st.expander("Step 4 – Classroom Configuration", expanded=True):
@@ -699,7 +710,7 @@ if st.button("Generate Seating", type="primary", use_container_width=True):
             st.warning(msg)
 
         st.session_state.pdf_buffer       = build_seating_pdf(assignments, seating_cols, df_lookup)
-        st.session_state.signature_buffer = build_signature_pdf(assignments, sig_cols, df_lookup)
+        st.session_state.signature_buffer = build_signature_pdf(assignments, sig_cols, df_lookup, extra_blank_rows=int(sig_extra_rows))
 
         st.success("Seating plan and signature sheet generated successfully!")
         metrics = st.columns(len(assignments))
