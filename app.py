@@ -90,10 +90,6 @@ def _register_unicode_fonts() -> tuple[str, str]:
 
 FONT_REG, FONT_BOLD = _register_unicode_fonts()
 
-# Paragraph styles used inside table cells (must be defined after fonts are resolved)
-_PARA_HEADER    = ParagraphStyle("th",      fontName=FONT_BOLD, fontSize=9, alignment=1, leading=11)
-_PARA_DATA_SEAT = ParagraphStyle("td-seat", fontName=FONT_REG,  fontSize=8, alignment=1, leading=16)
-_PARA_DATA_SIG  = ParagraphStyle("td-sig",  fontName=FONT_REG,  fontSize=8, alignment=1, leading=22)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,18 +257,36 @@ _NAME_W  = 90            # fixed width of the blank "Name" column on signature s
 _CELL_PAD = 10           # horizontal padding added to every measured cell width
 
 
-def _make_table_style(n_left_cols: int) -> TableStyle:
-    """Return a plain black-and-white table style.
+_HEADER_BG   = colors.HexColor("#1B3A5C")   # dark navy – header background
+_HEADER_FG   = colors.white                 # header text colour
+_ROW_ALT     = colors.HexColor("#EBF4FB")   # light-blue tint for odd data rows
+_GRID_COLOR  = colors.HexColor("#B0BEC5")   # soft grey grid lines
+_DIVIDER_CLR = colors.HexColor("#1B3A5C")   # colour of the centre divider
+
+
+def _make_table_style(n_left_cols: int, row_height: int) -> TableStyle:
+    """Return a styled table with a coloured header and alternating row tints.
 
     n_left_cols determines where the thick vertical divider is drawn between
-    the left and right student halves on each page. Font and row height are
-    controlled by the Paragraph styles embedded in each cell.
+    the left and right student halves on each page.
     """
     return TableStyle([
+        # ── Header row ──────────────────────────────────────────────────────
+        ("BACKGROUND", (0,  0), (-1,  0), _HEADER_BG),
+        ("TEXTCOLOR",  (0,  0), (-1,  0), _HEADER_FG),
+        ("FONTNAME",   (0,  0), (-1,  0), FONT_BOLD),
+        ("FONTSIZE",   (0,  0), (-1,  0), 9),
+        # ── Data rows ───────────────────────────────────────────────────────
+        ("FONTNAME",   (0,  1), (-1, -1), FONT_REG),
+        ("FONTSIZE",   (0,  1), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, _ROW_ALT]),
+        # ── Layout ──────────────────────────────────────────────────────────
         ("ALIGN",    (0, 0), (-1, -1), "CENTER"),
         ("VALIGN",   (0, 0), (-1, -1), "MIDDLE"),
-        ("GRID",     (0, 0), (-1, -1), 0.5, colors.black),
-        ("LINEAFTER", (n_left_cols - 1, 0), (n_left_cols - 1, -1), 2, colors.black),
+        ("ROWHEIGHT", (0, 0), (-1, -1), row_height),
+        # ── Grid & divider ──────────────────────────────────────────────────
+        ("GRID",      (0, 0), (-1, -1), 0.5, _GRID_COLOR),
+        ("LINEAFTER", (n_left_cols - 1, 0), (n_left_cols - 1, -1), 2.5, _DIVIDER_CLR),
     ])
 
 
@@ -299,8 +313,7 @@ def _compute_col_widths(
     n_fixed_right = n_blank_cols + (1 if include_signature else 0)
     half_ncols = 1 + n_data_cols + n_fixed_right
 
-    # Measure the natural (content-driven) width of each column.
-    # Cells may be Paragraph objects; extract their .text for measurement.
+    # Measure the natural (content-driven) width of each column
     natural = [0.0] * half_ncols
     for row_idx, row in enumerate(table_data):
         font = FONT_BOLD if row_idx == 0 else FONT_REG
@@ -309,9 +322,7 @@ def _compute_col_widths(
             for c in range(half_ncols):
                 src = side * half_ncols + c
                 if src < len(row):
-                    cell = row[src]
-                    text = cell.text if isinstance(cell, Paragraph) else str(cell)
-                    w = stringWidth(text, font, fsize) + _CELL_PAD
+                    w = stringWidth(str(row[src]), font, fsize) + _CELL_PAD
                     natural[c] = max(natural[c], w)
 
     # Seat column: just needs to fit "Seat" + up to 3-digit numbers
@@ -372,43 +383,26 @@ def _build_table_data(
     df_lookup: pd.DataFrame,
     include_signature: bool,
     blank_cols: list | None = None,
-    data_style: ParagraphStyle | None = None,
 ) -> list[list]:
     """Build all rows (header + data) for a two-halves-per-page layout.
 
     The page is split into left and right halves. Each half shows:
         Seat | data_cols... | [blank_cols...] | [Signature]
-
-    All cells are wrapped in Paragraph objects so text auto-wraps and row
-    heights expand to fit content.
     """
     blank_cols = blank_cols or []
-    ds = data_style or _PARA_DATA_SEAT
     sig = ["Signature"] if include_signature else []
     trailing = blank_cols + sig          # user-defined blank cols, then Signature
     half = math.ceil(len(students) / 2)
     left_half, right_half = students[:half], students[half:]
     n_data = len(data_cols)
-    n_trailing = len(trailing)
 
-    def ph(text: str) -> Paragraph:
-        return Paragraph(str(text), _PARA_HEADER)
-
-    def pd_(text: str) -> Paragraph:
-        return Paragraph(str(text), ds)
-
-    header = [ph("Seat")] + [ph(c) for c in data_cols] + [ph(t) for t in trailing] + \
-             [ph("Seat")] + [ph(c) for c in data_cols] + [ph(t) for t in trailing]
+    header = ["Seat"] + data_cols + trailing + ["Seat"] + data_cols + trailing
     rows = [header]
 
     for i in range(half):
-        left_vals  = _lookup_student_values(df_lookup, left_half[i],  data_cols)
-        left  = [pd_(i + 1)] + [pd_(v) for v in left_vals] + [pd_("") for _ in range(n_trailing)]
-        if i < len(right_half):
-            right_vals = _lookup_student_values(df_lookup, right_half[i], data_cols)
-            right = [pd_(i + 1 + half)] + [pd_(v) for v in right_vals] + [pd_("") for _ in range(n_trailing)]
-        else:
-            right = [pd_("") for _ in range(1 + n_data + n_trailing)]
+        left  = [str(i + 1)]        + _lookup_student_values(df_lookup, left_half[i],  data_cols) + [""] * len(trailing)
+        right = ([str(i + 1 + half)] + _lookup_student_values(df_lookup, right_half[i], data_cols) + [""] * len(trailing)
+                 if i < len(right_half) else [""] * (1 + n_data + len(trailing)))
         rows.append(left + right)
 
     return rows
@@ -428,7 +422,7 @@ def _build_pdf(
     title_style = _make_title_style()
 
     n_left_cols = 1 + len(columns) + len(blank_cols) + (1 if include_signature else 0)
-    data_style  = _PARA_DATA_SIG if include_signature else _PARA_DATA_SEAT
+    row_height  = 22 if include_signature else 16
 
     elements = []
     for i, (classroom, students) in enumerate(assignments.items()):
@@ -439,11 +433,11 @@ def _build_pdf(
         elements.append(Paragraph(heading, title_style))
         elements.append(Spacer(1, 10))
 
-        table_data = _build_table_data(students, columns, df_lookup, include_signature, blank_cols, data_style)
+        table_data = _build_table_data(students, columns, df_lookup, include_signature, blank_cols)
         # Compute widths from actual content so every column fits its data
         col_widths = _compute_col_widths(table_data, len(columns), include_signature, len(blank_cols))
         table = Table(table_data, colWidths=col_widths)
-        table.setStyle(_make_table_style(n_left_cols))
+        table.setStyle(_make_table_style(n_left_cols, row_height))
         elements.append(table)
 
     doc.build(elements)
